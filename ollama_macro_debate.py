@@ -860,7 +860,7 @@ def _top20_fallback_from_data(prices: dict[str, dict[str, Any]], fundamentals: d
         if vol_ratio is not None and vol_ratio >= 1.2:
             vol_confirm = 2.0
 
-        # GURU CONVICTION (0-10)
+        # GURU CONVICTION (0-15): num gurus + % cartera + elite bonus
         guru_bonus = 0.0
         if guru_conviction:
             guru_bonus = guru_conviction.get(ticker, 0.0)

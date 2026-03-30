@@ -333,33 +333,65 @@ def compute_guru_conviction(
     all_holdings: dict[str, list[dict[str, Any]]],
     tickers_dict: dict[str, dict[str, Any]],
 ) -> dict[str, float]:
-    """Calcula un bonus de convicción guru para cada ticker (0-10 puntos).
+    """Calcula un bonus de convicción guru para cada ticker (0-15 puntos).
 
-    - 1 gurú con posición → +2
-    - 2 gurús → +5
-    - 3+ gurús → +8
-    - Bonus extra +2 si incluye Buffett o Druckenmiller (trackrecord superior)
+    Factores:
+    1. Numero de gurus que tienen el activo (0-8 pts)
+    2. Peso medio en cartera de los gurus que lo tienen (0-5 pts)
+       - >5% del portfolio → +5 (alta conviccion)
+       - 2-5% → +3
+       - 0.5-2% → +1.5
+       - <0.5% → +0.5
+    3. Bonus elite +2 si Buffett o Druckenmiller lo tienen
     """
+    # Calcular valor total de cartera por guru
+    guru_totals: dict[str, float] = {}
+    for guru_name, holdings in all_holdings.items():
+        total = sum(h["value_thousands"] for h in holdings)
+        if total > 0:
+            guru_totals[guru_name] = total
+
     matched = match_holdings_to_universe(all_holdings, tickers_dict)
     scores: dict[str, float] = {}
 
     for ticker, info in matched.items():
         count = info["guru_count"]
-        if count >= 3:
-            base = 8.0
-        elif count == 2:
-            base = 5.0
-        else:
-            base = 2.0
 
-        # Bonus por gurús con mejor trackrecord
+        # Factor 1: numero de gurus (0-8)
+        if count >= 3:
+            count_score = 8.0
+        elif count == 2:
+            count_score = 5.0
+        else:
+            count_score = 2.0
+
+        # Factor 2: peso medio en cartera (0-5)
+        pct_list: list[float] = []
+        for detail in info["details"]:
+            guru_name = detail["guru"]
+            guru_total = guru_totals.get(guru_name, 0)
+            if guru_total > 0:
+                pct = (detail["value_thousands"] / guru_total) * 100
+                pct_list.append(pct)
+
+        avg_pct = sum(pct_list) / len(pct_list) if pct_list else 0.0
+        if avg_pct > 5.0:
+            weight_score = 5.0
+        elif avg_pct > 2.0:
+            weight_score = 3.0
+        elif avg_pct > 0.5:
+            weight_score = 1.5
+        else:
+            weight_score = 0.5
+
+        # Factor 3: bonus elite (0-2)
         elite_bonus = 0.0
         for g in info["gurus"]:
             if g in ("Warren Buffett", "Stanley Druckenmiller"):
                 elite_bonus = 2.0
                 break
 
-        scores[ticker] = min(10.0, base + elite_bonus)
+        scores[ticker] = min(15.0, count_score + weight_score + elite_bonus)
 
     return scores
 
@@ -375,6 +407,13 @@ def guru_holdings_section(
 ) -> str:
     """Genera la sección textual de carteras de gurús para el output."""
     matched = match_holdings_to_universe(all_holdings, tickers_dict)
+
+    # Calcular totales por guru para porcentajes
+    guru_totals: dict[str, float] = {}
+    for guru_name, holdings in all_holdings.items():
+        total = sum(h["value_thousands"] for h in holdings)
+        if total > 0:
+            guru_totals[guru_name] = total
 
     lines: list[str] = []
     lines.append("")
@@ -392,24 +431,31 @@ def guru_holdings_section(
 
     # Top 20 que coinciden con carteras de gurús
     lines.append("COINCIDENCIAS CON TOP 20:")
-    lines.append(f"  {'Ticker':<10} {'Gurus':>5} {'Quienes':<50} {'Valor ($M)':>12}")
+    lines.append(f"  {'Ticker':<10} {'Gurus':>5} {'Quienes':<40} {'%Cartera':>10} {'Valor ($M)':>12}")
     lines.append("  " + "-" * 77)
 
     found_any = False
     for ticker in top20_tickers:
         if ticker in matched:
             info = matched[ticker]
+            # Calcular % medio de cartera
+            pcts = []
+            for d in info["details"]:
+                gt = guru_totals.get(d["guru"], 0)
+                if gt > 0:
+                    pcts.append((d["value_thousands"] / gt) * 100)
+            avg_pct = sum(pcts) / len(pcts) if pcts else 0.0
             gurus_str = ", ".join(info["gurus"])
             val_m = info["total_value"] / 1_000
-            lines.append(f"  {ticker:<10} {info['guru_count']:>5} {gurus_str:<50} {val_m:>12,.1f}")
+            lines.append(f"  {ticker:<10} {info['guru_count']:>5} {gurus_str:<40} {avg_pct:>9.2f}% {val_m:>12,.1f}")
             found_any = True
 
     if not found_any:
-        lines.append("  (Ningún activo del Top 20 coincide con las carteras de gurús)")
+        lines.append("  (Ningun activo del Top 20 coincide con las carteras de gurus)")
 
     lines.append("")
 
-    # Activos fuera del Top 20 con alta convicción (3+ gurús)
+    # Activos fuera del Top 20 con alta convicción (2+ gurús)
     high_conviction = [
         (t, i) for t, i in matched.items()
         if i["guru_count"] >= 2 and t not in top20_tickers
@@ -417,11 +463,17 @@ def guru_holdings_section(
     if high_conviction:
         high_conviction.sort(key=lambda x: x[1]["guru_count"], reverse=True)
         lines.append("ACTIVOS CON ALTA CONVICCION GURU (fuera del Top 20):")
-        lines.append(f"  {'Ticker':<10} {'Gurus':>5} {'Quienes':<50}")
+        lines.append(f"  {'Ticker':<10} {'Gurus':>5} {'Quienes':<40} {'%Cartera':>10}")
         lines.append("  " + "-" * 65)
         for ticker, info in high_conviction[:10]:
+            pcts = []
+            for d in info["details"]:
+                gt = guru_totals.get(d["guru"], 0)
+                if gt > 0:
+                    pcts.append((d["value_thousands"] / gt) * 100)
+            avg_pct = sum(pcts) / len(pcts) if pcts else 0.0
             gurus_str = ", ".join(info["gurus"])
-            lines.append(f"  {ticker:<10} {info['guru_count']:>5} {gurus_str:<50}")
+            lines.append(f"  {ticker:<10} {info['guru_count']:>5} {gurus_str:<40} {avg_pct:>9.2f}%")
         lines.append("")
 
     output = "\n".join(lines)
