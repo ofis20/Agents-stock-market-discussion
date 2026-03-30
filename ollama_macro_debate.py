@@ -15,6 +15,11 @@ from typing import Any, List
 import requests
 
 from market_data import FUNDAMENTAL_TICKERS, TICKERS, load_all_market_data
+from guru_holdings import (
+    fetch_all_guru_holdings,
+    compute_guru_conviction,
+    guru_holdings_section,
+)
 
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
@@ -698,7 +703,7 @@ def _normalize_weights_100(scores: list[float]) -> list[int]:
 _ALLOWED_TYPES = {"Accion", "ETF", "Commodity", "Cripto"}
 
 
-def _top20_fallback_from_data(prices: dict[str, dict[str, Any]], fundamentals: dict[str, dict[str, Any]], exclude_tickers: set[str] | None = None) -> list[dict[str, Any]]:
+def _top20_fallback_from_data(prices: dict[str, dict[str, Any]], fundamentals: dict[str, dict[str, Any]], exclude_tickers: set[str] | None = None, guru_conviction: dict[str, float] | None = None) -> list[dict[str, Any]]:
     # Calcular sector momentum para bonus sectorial (top 3 sectores)
     sector_momentum: dict[str, list[float]] = {}
     for _tk, _f in fundamentals.items():
@@ -855,13 +860,19 @@ def _top20_fallback_from_data(prices: dict[str, dict[str, Any]], fundamentals: d
         if vol_ratio is not None and vol_ratio >= 1.2:
             vol_confirm = 2.0
 
+        # GURU CONVICTION (0-10)
+        guru_bonus = 0.0
+        if guru_conviction:
+            guru_bonus = guru_conviction.get(ticker, 0.0)
+
         # Score total: nuevo sistema multi-factor
         score = (
             trend_bonus + rsi_bonus + ew_bonus + fundamental_bonus +
             rs_bonus + mom_bonus + sharpe_bonus + macd_bonus +
-            sector_bonus + vol_confirm - (0.03 * vol)
+            sector_bonus + vol_confirm + guru_bonus - (0.03 * vol)
         )
-        thesis = f"Elliott {ew_onda}, Mom {_fmt_num(momentum, 1)}, Sharpe {_fmt_num(sharpe, 2)}, RS {_fmt_num(rs_sp500, 1)}."
+        guru_tag = f", Guru {guru_bonus:.0f}" if guru_bonus > 0 else ""
+        thesis = f"Elliott {ew_onda}, Mom {_fmt_num(momentum, 1)}, Sharpe {_fmt_num(sharpe, 2)}, RS {_fmt_num(rs_sp500, 1)}{guru_tag}."
         rows.append((ticker, score, thesis, tipo, vol))
 
     rows.sort(key=lambda x: x[1], reverse=True)
@@ -986,6 +997,7 @@ def top20_investments(
     fundamentals: dict[str, dict[str, Any]],
     market_briefing: str = "",
     exclude_tickers: set[str] | None = None,
+    guru_conviction: dict[str, float] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Genera top20 diversificado (acciones, ETFs, commodities, cripto). Fallback determinista si el LLM falla."""
     context = recent_context(transcript, max_lines=len(transcript))
@@ -1047,7 +1059,7 @@ def top20_investments(
     valid_sum = sum(a["peso"] for a in parsed) == 100
     if len(parsed) != 20 or not valid_sum:
         print(f"\n  [AVISO: Top20 del modelo invalido ({len(parsed)} filas, suma={sum(a['peso'] for a in parsed)}). Usando fallback.]", flush=True)
-        parsed = _top20_fallback_from_data(prices, fundamentals, exclude_tickers=exclude_tickers)
+        parsed = _top20_fallback_from_data(prices, fundamentals, exclude_tickers=exclude_tickers, guru_conviction=guru_conviction)
 
     final = _render_top20_lines(parsed)
     print("\n[Top 20 validado]", flush=True)
@@ -1647,6 +1659,11 @@ def run_debate(args: argparse.Namespace) -> int:
     else:
         print("\n[AVISO: Sin datos de mercado - el debate usara solo conocimiento del modelo]")
 
+    # Fase 0b: Cargar carteras reales de gurús (13F SEC EDGAR)
+    print("\n[Cargando carteras reales de gurus (13F)...]", flush=True)
+    all_guru_holdings = fetch_all_guru_holdings()
+    guru_conv = compute_guru_conviction(all_guru_holdings, TICKERS)
+
     transcript: List[str] = []
     start = time.monotonic()
     deadline = start + max(5, args.seconds)
@@ -1687,6 +1704,7 @@ def run_debate(args: argparse.Namespace) -> int:
         prices=raw_prices,
         fundamentals=raw_fundamentals,
         market_briefing=market_general,
+        guru_conviction=guru_conv,
     )
 
     # Fase 4: Evaluaciones independientes (con datos reales)
@@ -1727,6 +1745,13 @@ def run_debate(args: argparse.Namespace) -> int:
         macd_table=macd_table,
     )
 
+    # Fase 5b: Carteras reales de gurus
+    guru_holdings_section(
+        all_holdings=all_guru_holdings,
+        tickers_dict=TICKERS,
+        top20_tickers=[a["ticker"] for a in top20_assets],
+    )
+
     # === SEGUNDA PASADA: excluir activos EVITAR ===
     evitar_tickers = _extract_evitar_tickers(verdict_output)
     if evitar_tickers:
@@ -1744,6 +1769,7 @@ def run_debate(args: argparse.Namespace) -> int:
             fundamentals=raw_fundamentals,
             market_briefing=market_general,
             exclude_tickers=evitar_tickers,
+            guru_conviction=guru_conv,
         )
 
         ta_combined2, ew_table2 = technical_analysis_review(
@@ -1796,6 +1822,7 @@ def run_debate(args: argparse.Namespace) -> int:
                 fundamentals=raw_fundamentals,
                 market_briefing=market_general,
                 exclude_tickers=all_excluded,
+                guru_conviction=guru_conv,
             )
 
             ta_combined3, ew_table3 = technical_analysis_review(

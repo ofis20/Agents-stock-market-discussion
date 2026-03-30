@@ -30,6 +30,7 @@ SECTION_HINTS = {
     "REVISION DE GESTION DE RIESGOS": "Gestion de riesgos",
     "REVISION DE SENTIMIENTO DE MERCADO": "Sentimiento de mercado",
     "REVISION DE MACD": "MACD",
+    "CARTERAS REALES DE GURUS": "Carteras de Gurus",
     "VEREDICTO FINAL CONSOLIDADO": "Veredicto final",
 }
 
