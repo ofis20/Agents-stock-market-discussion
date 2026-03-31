@@ -1684,13 +1684,17 @@ def institutional_analysis_review(top10_assets: list[dict[str, Any]], fundamenta
             ok_count += 1
 
         rec_str = f"{rec_mean:.1f}({rec_key})" if rec_mean is not None else "N/D"
+        n_str = f"{int(num_analysts)}" if num_analysts is not None else "N/D"
+        upside = None
+        if target_mean and current_price and current_price > 0:
+            upside = ((target_mean / current_price) - 1) * 100
+        up_str = f"{upside:+.1f}%" if upside is not None else "N/D"
         inst_str = f"{inst_pct * 100:.0f}%" if inst_pct else "N/D"
         short_str = f"{short_pct * 100:.1f}%" if short_pct else "N/D"
-        reason = f"Score {score_num}/100 | Rec {rec_str} | Inst {inst_str} | Short {short_str}."
         nombre = asset.get("nombre", t)
-        rows.append([str(i), t, nombre, tipo, f"{asset['peso']}%", verdict, reason])
+        rows.append([str(i), t, nombre, tipo, f"{asset['peso']}%", rec_str, n_str, up_str, inst_str, short_str, verdict])
 
-    table = _render_md_table(["#", "Ticker", "Nombre", "Tipo", "%Cartera", "Veredicto", "Institucional detalle"], rows)
+    table = _render_md_table(["#", "Ticker", "Nombre", "Tipo", "%Cartera", "Consenso", "Analistas", "Upside", "Institucional", "Short%", "Veredicto"], rows)
     print("\n[Tabla institucional validada]", flush=True)
     print(table, flush=True)
     print(f"\nResultado: {ok_count} OK / {len(top10_assets) - ok_count} NOK de {len(top10_assets)} activos.", flush=True)
