@@ -30,6 +30,7 @@ SECTION_HINTS = {
     "REVISION DE GESTION DE RIESGOS": "Gestion de riesgos",
     "REVISION DE SENTIMIENTO DE MERCADO": "Sentimiento de mercado",
     "REVISION DE MACD": "MACD",
+    "REVISION INSTITUCIONAL": "Institucional",
     "CARTERAS REALES DE GURUS": "Carteras de Gurus",
     "VEREDICTO FINAL CONSOLIDADO": "Veredicto final",
 }
@@ -41,6 +42,7 @@ SCORE_TABLE_KEYS = {
     "Sentimiento de mercado": "Sentimiento",
     "Ondas de Elliott": "Elliott",
     "MACD": "MACD",
+    "Institucional": "Institucional",
 }
 
 
@@ -131,6 +133,8 @@ def _detect_phase(line: str) -> str | None:
         return "Gestion de riesgos..."
     if "SENTIMIENTO DE MERCADO" in upper:
         return "Sentimiento de mercado..."
+    if "REVISION INSTITUCIONAL" in upper:
+        return "Analisis institucional..."
     if "VEREDICTO FINAL" in upper:
         return "Veredicto final..."
     return None
@@ -537,7 +541,7 @@ def build_scoreboard(top10_df: pd.DataFrame, tables: list[tuple[str, pd.DataFram
 
         score_df[role_col] = score_df["Ticker"].astype(str).str.upper().map(lookup)
 
-    evaluator_cols = ["Tecnico", "Fundamental", "Riesgo", "Sentimiento", "Elliott", "MACD"]
+    evaluator_cols = ["Tecnico", "Fundamental", "Riesgo", "Sentimiento", "Elliott", "MACD", "Institucional"]
     for col in evaluator_cols:
         score_df[col] = score_df[col].fillna("N/D")
 
@@ -548,12 +552,13 @@ def build_scoreboard(top10_df: pd.DataFrame, tables: list[tuple[str, pd.DataFram
         + (score_df["Sentimiento"] == "OK").astype(int)
         + (score_df["Elliott"] == "OK").astype(int)
         + (score_df["MACD"] == "OK").astype(int)
+        + (score_df["Institucional"] == "OK").astype(int)
     )
 
     def suggested_action(score: int) -> str:
-        if score >= 5:
+        if score >= 6:
             return "COMPRAR"
-        if score >= 3:
+        if score >= 4:
             return "VIGILAR"
         return "EVITAR"
 
@@ -572,7 +577,7 @@ def render_scoreboard(score_df: pd.DataFrame) -> None:
     best = score_df.iloc[0]
     c1, c2, c3 = st.columns(3)
     c1.metric("Mejor activo", str(best["Ticker"]))
-    c2.metric("Puntaje maximo", f"{int(best['Puntaje'])}/6")
+    c2.metric("Puntaje maximo", f"{int(best['Puntaje'])}/7")
     c3.metric("Decision sugerida", str(best["Decision sugerida"]))
 
     def _color_score(val):
@@ -580,9 +585,9 @@ def render_scoreboard(score_df: pd.DataFrame) -> None:
             v = int(val)
         except (ValueError, TypeError):
             return ""
-        if v >= 5:
+        if v >= 6:
             return "background-color: #c6efce; color: #006100"
-        if v >= 3:
+        if v >= 4:
             return "background-color: #ffeb9c; color: #9c5700"
         return "background-color: #ffc7ce; color: #9c0006"
 

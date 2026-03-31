@@ -554,6 +554,95 @@ def _compute_sharpe(series: pd.Series, days: int = 126) -> float | None:
     return float((rets.mean() / rets.std()) * (252 ** 0.5))
 
 
+def _compute_bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0) -> dict[str, float | None]:
+    """Bollinger Bands: upper, lower, %B (posicion relativa), bandwidth (squeeze)."""
+    if len(series) < period:
+        return {"bb_upper": None, "bb_lower": None, "bb_pct_b": None, "bb_bandwidth": None}
+    sma = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = sma + num_std * std
+    lower = sma - num_std * std
+    last_upper = float(upper.iloc[-1])
+    last_lower = float(lower.iloc[-1])
+    last_sma = float(sma.iloc[-1])
+    last_price = float(series.iloc[-1])
+    width = last_upper - last_lower
+    pct_b = (last_price - last_lower) / width if width > 0 else None
+    bandwidth = width / last_sma * 100 if last_sma > 0 else None
+    return {
+        "bb_upper": last_upper,
+        "bb_lower": last_lower,
+        "bb_pct_b": pct_b,
+        "bb_bandwidth": bandwidth,
+    }
+
+
+def _compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float | None:
+    """ADX (Average Directional Index): mide fuerza de tendencia (0-100)."""
+    if len(close) < period * 3:
+        return None
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr = tr.rolling(window=period).mean()
+    plus_di = 100 * plus_dm.rolling(window=period).mean() / atr
+    minus_di = 100 * minus_dm.rolling(window=period).mean() / atr
+    di_sum = plus_di + minus_di
+    dx = 100 * (plus_di - minus_di).abs() / di_sum.replace(0, float("nan"))
+    adx = dx.rolling(window=period).mean()
+    last_vals = adx.dropna()
+    return float(last_vals.iloc[-1]) if not last_vals.empty else None
+
+
+def _detect_rsi_divergence(close: pd.Series, period: int = 14, lookback: int = 40) -> str:
+    """Detecta divergencias RSI vs precio: 'bullish', 'bearish' o 'none'.
+
+    Bullish: precio hace lower low pero RSI hace higher low.
+    Bearish: precio hace higher high pero RSI hace lower high.
+    """
+    if len(close) < period + lookback:
+        return "none"
+    # Calcular RSI para los ultimos lookback dias
+    rsi_full = []
+    for i in range(lookback):
+        idx = len(close) - lookback + i
+        sub = close.iloc[:idx + 1]
+        if len(sub) >= period + 1:
+            rsi_full.append(_compute_rsi(sub, period))
+        else:
+            rsi_full.append(None)
+    rsi_series = pd.Series(rsi_full)
+    price_series = close.tail(lookback).reset_index(drop=True)
+    # Dividir en dos mitades y buscar extremos
+    mid = lookback // 2
+    p_first = price_series.iloc[:mid]
+    p_second = price_series.iloc[mid:]
+    r_first = rsi_series.iloc[:mid]
+    r_second = rsi_series.iloc[mid:]
+    # Bullish: precio lower low, RSI higher low
+    p_low1 = p_first.min()
+    p_low2 = p_second.min()
+    r_low1 = r_first.dropna().min() if not r_first.dropna().empty else None
+    r_low2 = r_second.dropna().min() if not r_second.dropna().empty else None
+    if r_low1 is not None and r_low2 is not None:
+        if p_low2 < p_low1 and r_low2 > r_low1:
+            return "bullish"
+    # Bearish: precio higher high, RSI lower high
+    p_high1 = p_first.max()
+    p_high2 = p_second.max()
+    r_high1 = r_first.dropna().max() if not r_first.dropna().empty else None
+    r_high2 = r_second.dropna().max() if not r_second.dropna().empty else None
+    if r_high1 is not None and r_high2 is not None:
+        if p_high2 > p_high1 and r_high2 < r_high1:
+            return "bearish"
+    return "none"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DESCARGA DE DATOS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -668,6 +757,32 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
             if all(r is not None for r in [ret_1m, ret_3m, ret_6m, ret_12m]):
                 momentum_score = ret_1m * 0.15 + ret_3m * 0.25 + ret_6m * 0.30 + ret_12m * 0.30
 
+            # Bollinger Bands (20, 2σ)
+            bb_data = _compute_bollinger(close)
+
+            # ADX (14) - necesita High y Low
+            adx_val = None
+            try:
+                if len(tickers_list) > 1:
+                    high_s = data["High"][ticker].dropna()
+                    low_s = data["Low"][ticker].dropna()
+                else:
+                    high_s = data["High"].dropna()
+                    low_s = data["Low"].dropna()
+                # Alinear indices
+                common_idx = close.index.intersection(high_s.index).intersection(low_s.index)
+                if len(common_idx) > 42:
+                    adx_val = _compute_adx(
+                        high_s.loc[common_idx],
+                        low_s.loc[common_idx],
+                        close.loc[common_idx],
+                    )
+            except Exception:
+                pass
+
+            # RSI Divergencia
+            rsi_divergence = _detect_rsi_divergence(close)
+
             results[ticker] = {
                 "nombre": meta["nombre"], "tipo": meta["tipo"],
                 "precio": precio_actual,
@@ -676,7 +791,7 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
                 "sma50": sma50, "sma200": sma200, "rsi14": rsi14,
                 "vol_20d": vol_20d, "max_dd_12m": max_dd, "dist_high_52w": dist_high,
                 "close_hist": close.tolist(),
-                # Nuevos campos
+                # Indicadores de momentum
                 "macd": macd_data["macd"],
                 "macd_signal": macd_data["macd_signal"],
                 "macd_hist": macd_data["macd_hist"],
@@ -685,6 +800,14 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
                 "vol_ratio": vol_ratio,
                 "rs_vs_sp500": rs_vs_sp500,
                 "momentum_score": momentum_score,
+                # Bollinger Bands
+                "bb_upper": bb_data["bb_upper"],
+                "bb_lower": bb_data["bb_lower"],
+                "bb_pct_b": bb_data["bb_pct_b"],
+                "bb_bandwidth": bb_data["bb_bandwidth"],
+                # ADX + RSI divergencia
+                "adx": adx_val,
+                "rsi_divergence": rsi_divergence,
             }
         except Exception:
             continue
@@ -718,6 +841,18 @@ def _fetch_single_fundamental(ticker_str: str) -> tuple[str, dict[str, Any] | No
             "div_yield": info.get("dividendYield"),
             "beta": info.get("beta"),
             "sector": info.get("sector", "N/D"),
+            # Datos institucionales / analistas (de .info)
+            "target_mean_price": info.get("targetMeanPrice"),
+            "target_low_price": info.get("targetLowPrice"),
+            "target_high_price": info.get("targetHighPrice"),
+            "recommendation_mean": info.get("recommendationMean"),  # 1=strong buy .. 5=strong sell
+            "recommendation_key": info.get("recommendationKey", ""),
+            "num_analysts": info.get("numberOfAnalystOpinions"),
+            "insider_pct": info.get("heldPercentInsiders"),
+            "institutional_pct": info.get("heldPercentInstitutions"),
+            "short_ratio": info.get("shortRatio"),
+            "short_pct_float": info.get("shortPercentOfFloat"),
+            "current_price": info.get("currentPrice") or info.get("previousClose"),
         }
     except Exception:
         return ticker_str, None

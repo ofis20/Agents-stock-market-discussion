@@ -33,11 +33,11 @@ class Agent:
 
 
 # Modelos generalistas preferidos para el debate (orden de preferencia).
-# Se excluyen modelos de codigo (deepseek-coder, codellama) que no rinden bien en debates.
+# Prioridad: modelos mas grandes (12-14B) primero, luego medianos (7-9B).
 PREFERRED_MODELS = [
-    "llama3.1:8b", "llama3.1", "gemma2:9b", "gemma2",
+    "qwen2.5:14b", "mistral-nemo:12b", "mistral-nemo",
+    "gemma2:9b", "gemma2", "llama3.1:8b", "llama3.1",
     "qwen2.5:7b", "qwen2.5", "mistral:latest", "mistral",
-    "phi3.5:latest", "phi3.5", "phi3:latest", "phi3",
     "llama3:8b", "llama3", "llama2:7b", "llama2",
     "command-r:latest", "command-r",
 ]
@@ -1086,52 +1086,76 @@ def technical_analysis_review(top10_assets: list[dict[str, Any]], prices: dict[s
         rsi = _to_float(d.get("rsi14"))
         vol = _to_float(d.get("vol_20d"))
         vol_ratio = _to_float(d.get("vol_ratio"))
+        bb_pct_b = _to_float(d.get("bb_pct_b"))
+        bb_bw = _to_float(d.get("bb_bandwidth"))
+        adx = _to_float(d.get("adx"))
+        rsi_div = d.get("rsi_divergence", "none")
 
         # Score numerico 0-100
         pts = 0.0
-        # Tendencia (0-35 pts)
+        # Tendencia (0-25 pts)
         if p and sma50 and sma200:
             if p > sma50 > sma200:
-                pts += 35
+                pts += 25
             elif p > sma200:
-                pts += 20
+                pts += 15
             elif p > sma50:
-                pts += 10
-        # RSI (0-30 pts): ideal 45-65
+                pts += 8
+        # RSI (0-20 pts): ideal 45-65
         if rsi is not None:
             if 45 <= rsi <= 65:
-                pts += 30
+                pts += 20
             elif 40 <= rsi <= 70:
-                pts += 22
+                pts += 15
             elif 30 <= rsi <= 78:
-                pts += 12
+                pts += 8
             elif rsi < 30:
-                pts += 8  # oversold puede ser oportunidad
-        # Volatilidad (0-20 pts)
+                pts += 5  # oversold puede ser oportunidad
+        # Volatilidad (0-10 pts)
         if vol is not None:
             if vol <= 25:
-                pts += 20
-            elif vol <= 35:
-                pts += 15
-            elif vol <= 45:
                 pts += 10
-            elif vol <= 55:
-                pts += 5
-        # Confirmacion por volumen (0-15 pts)
+            elif vol <= 35:
+                pts += 7
+            elif vol <= 45:
+                pts += 4
+        # Confirmacion por volumen (0-10 pts)
         if vol_ratio is not None:
             if vol_ratio >= 1.2:
-                pts += 15  # volumen activo confirma tendencia
+                pts += 10
             elif vol_ratio >= 0.8:
-                pts += 10  # volumen normal
+                pts += 6
             else:
-                pts += 3   # baja liquidez, senal debil
+                pts += 2
+        # Bollinger Bands %B (0-15 pts): ideal 0.3-0.8 (en la mitad-superior)
+        if bb_pct_b is not None:
+            if 0.4 <= bb_pct_b <= 0.8:
+                pts += 15  # zona ideal, tendencia sana
+            elif 0.2 <= bb_pct_b <= 0.95:
+                pts += 10
+            elif bb_pct_b < 0.1:
+                pts += 5   # cerca de lower band, posible rebote
+            # >0.95 sobrecomprado, 0 pts
+        # ADX fuerza de tendencia (0-10 pts)
+        if adx is not None:
+            if adx >= 25:
+                pts += 10  # tendencia fuerte
+            elif adx >= 20:
+                pts += 6   # tendencia moderada
+            elif adx >= 15:
+                pts += 3   # tendencia debil
+        # RSI Divergencia (0-10 pts)
+        if rsi_div == "bullish":
+            pts += 10  # senal de compra fuerte
+        elif rsi_div == "bearish":
+            pts -= 5   # penalizacion
 
         score_num = min(100, max(0, round(pts)))
         verdict = "OK" if score_num >= 60 else "NOK"
         if verdict == "OK":
             ok_count += 1
 
-        reason = f"Score {score_num}/100 | RSI {_fmt_num(rsi, 1)} | SMA50 {_fmt_num(sma50, 2)} | Vol {_fmt_num(vol, 1)}% | VolRatio {_fmt_num(vol_ratio, 2)}."
+        reason = f"Score {score_num}/100 | RSI {_fmt_num(rsi, 1)} | BB%B {_fmt_num(bb_pct_b, 2)} | ADX {_fmt_num(adx, 1)} | Div {rsi_div} | Vol {_fmt_num(vol, 1)}%."
         nombre = asset.get("nombre", t)
         rows.append([str(i), t, nombre, asset.get("tipo", "Accion"), f"{asset['peso']}%", verdict, reason])
 
@@ -1192,60 +1216,75 @@ def fundamental_analysis_review(top10_assets: list[dict[str, Any]], fundamentals
         de = _to_float(f.get("deuda_equity"))
         growth = _to_float(f.get("crec_ingresos"))
         earnings_g = _to_float(f.get("earnings_growth"))
+        target_mean = _to_float(f.get("target_mean_price"))
+        current_price = _to_float(f.get("current_price"))
 
         if tipo == "Accion":
             # Score 0-100 por fundamentales
             pts = 0.0
-            # PER (0-25 pts): menor es mejor
+            # PER (0-20 pts): menor es mejor
             eff_pe = forward_pe if forward_pe else per
             if eff_pe is not None:
                 if eff_pe <= 15:
-                    pts += 25
-                elif eff_pe <= 25:
                     pts += 20
+                elif eff_pe <= 25:
+                    pts += 16
                 elif eff_pe <= 35:
-                    pts += 12
+                    pts += 10
                 elif eff_pe <= 50:
-                    pts += 5
-            # PEG ratio (0-15 pts): <1 es excelente
+                    pts += 4
+            # PEG ratio (0-12 pts): <1 es excelente
             if peg is not None:
                 if peg <= 1.0:
-                    pts += 15
+                    pts += 12
                 elif peg <= 1.5:
-                    pts += 10
+                    pts += 8
                 elif peg <= 2.5:
                     pts += 5
-            # ROE (0-25 pts)
+            # ROE (0-20 pts)
             if roe is not None:
                 if roe >= 0.25:
-                    pts += 25
-                elif roe >= 0.15:
                     pts += 20
+                elif roe >= 0.15:
+                    pts += 16
                 elif roe >= 0.10:
-                    pts += 12
+                    pts += 10
                 elif roe >= 0.05:
-                    pts += 5
-            # Deuda/Equity (0-20 pts)
+                    pts += 4
+            # Deuda/Equity (0-16 pts)
             if de is not None:
                 if de <= 50:
-                    pts += 20
+                    pts += 16
                 elif de <= 100:
-                    pts += 15
+                    pts += 12
                 elif de <= 180:
-                    pts += 8
-            # Crecimiento ingresos (0-15 pts)
+                    pts += 6
+            # Crecimiento ingresos (0-12 pts)
             if growth is not None:
                 if growth > 0.20:
-                    pts += 15
+                    pts += 12
                 elif growth > 0.10:
-                    pts += 10
+                    pts += 8
                 elif growth > 0:
+                    pts += 4
+            # Upside analistas (0-20 pts): diferencia entre target y precio actual
+            upside_pct = None
+            if target_mean and current_price and current_price > 0:
+                upside_pct = ((target_mean / current_price) - 1) * 100
+                if upside_pct >= 30:
+                    pts += 20
+                elif upside_pct >= 15:
+                    pts += 15
+                elif upside_pct >= 5:
+                    pts += 10
+                elif upside_pct >= 0:
                     pts += 5
             score_num = min(100, max(0, round(pts)))
             verdict = "OK" if score_num >= 55 else "NOK"
             peg_str = f"{peg:.2f}" if peg else "N/D"
             fpe_str = f"{forward_pe:.1f}" if forward_pe else "N/D"
-            reason = f"Score {score_num}/100 | PER {per if per is not None else 'N/D'} | FwdPE {fpe_str} | PEG {peg_str} | ROE {roe if roe is not None else 'N/D'} | D/E {de if de is not None else 'N/D'}."
+            up_str = f"{upside_pct:+.1f}%" if upside_pct is not None else "N/D"
+            reason = f"Score {score_num}/100 | FwdPE {fpe_str} | PEG {peg_str} | ROE {roe if roe is not None else 'N/D'} | Upside {up_str}."
         else:
             # ETFs, Commodities, Cripto: score 0-100 por momentum + volatilidad
             d = prices.get(t, {})
@@ -1520,6 +1559,144 @@ def macd_analysis_review(top10_assets: list[dict[str, Any]], prices: dict[str, d
     return table
 
 
+def institutional_analysis_review(top10_assets: list[dict[str, Any]], fundamentals: dict[str, dict[str, Any]], prices: dict[str, dict[str, Any]]) -> str:
+    """7mo evaluador: Analisis Institucional — consenso analistas, posiciones institucionales, short interest."""
+    print("\n" + "=" * 60, flush=True)
+    print("REVISION INSTITUCIONAL (determinista)", flush=True)
+    print("=" * 60, flush=True)
+
+    total = len(top10_assets)
+    rows: list[list[str]] = []
+    ok_count = 0
+    for i, asset in enumerate(top10_assets, start=1):
+        t = asset["ticker"]
+        print(f"[Evaluando {i}/{total}: {t}]", flush=True)
+        tipo = asset.get("tipo", "Accion")
+        f = fundamentals.get(t, {})
+        d = prices.get(t, {})
+
+        rec_mean = _to_float(f.get("recommendation_mean"))  # 1=strong buy .. 5=strong sell
+        rec_key = f.get("recommendation_key", "")
+        num_analysts = _to_float(f.get("num_analysts"))
+        target_mean = _to_float(f.get("target_mean_price"))
+        current_price = _to_float(f.get("current_price"))
+        inst_pct = _to_float(f.get("institutional_pct"))
+        short_ratio = _to_float(f.get("short_ratio"))
+        short_pct = _to_float(f.get("short_pct_float"))
+
+        pts = 0.0
+
+        if tipo == "Accion":
+            # Consenso analistas (0-30 pts): 1=strong buy, 2=buy, 3=hold, 4=sell, 5=strong sell
+            if rec_mean is not None:
+                if rec_mean <= 1.5:
+                    pts += 30  # strong buy
+                elif rec_mean <= 2.0:
+                    pts += 25  # buy
+                elif rec_mean <= 2.5:
+                    pts += 18  # buy-hold
+                elif rec_mean <= 3.0:
+                    pts += 10  # hold
+                elif rec_mean <= 3.5:
+                    pts += 5   # hold-sell
+                # >3.5 sell, 0 pts
+
+            # Cobertura de analistas (0-10 pts): mas analistas = mas confianza
+            if num_analysts is not None:
+                if num_analysts >= 20:
+                    pts += 10
+                elif num_analysts >= 10:
+                    pts += 7
+                elif num_analysts >= 5:
+                    pts += 4
+
+            # Upside al target (0-25 pts)
+            upside = None
+            if target_mean and current_price and current_price > 0:
+                upside = ((target_mean / current_price) - 1) * 100
+                if upside >= 30:
+                    pts += 25
+                elif upside >= 15:
+                    pts += 20
+                elif upside >= 5:
+                    pts += 12
+                elif upside >= 0:
+                    pts += 5
+
+            # Participacion institucional (0-15 pts): alta = confianza profesional
+            if inst_pct is not None:
+                if inst_pct >= 0.70:
+                    pts += 15
+                elif inst_pct >= 0.50:
+                    pts += 10
+                elif inst_pct >= 0.30:
+                    pts += 5
+
+            # Short interest (0-20 pts): bajo short = menos riesgo bajista
+            if short_pct is not None:
+                if short_pct <= 0.02:
+                    pts += 20
+                elif short_pct <= 0.05:
+                    pts += 15
+                elif short_pct <= 0.10:
+                    pts += 8
+                elif short_pct <= 0.15:
+                    pts += 3
+                # >15% short = alto riesgo, 0 pts
+            elif short_ratio is not None:
+                if short_ratio <= 2:
+                    pts += 15
+                elif short_ratio <= 5:
+                    pts += 8
+        else:
+            # ETFs, Commodities, Cripto: scoring simplificado
+            # Usar momentum y volume como proxy de interes institucional
+            mom = _to_float(d.get("momentum_score"))
+            vol_ratio = _to_float(d.get("vol_ratio"))
+            sharpe = _to_float(d.get("sharpe_6m"))
+            if mom is not None:
+                if mom > 15:
+                    pts += 40
+                elif mom > 5:
+                    pts += 30
+                elif mom > 0:
+                    pts += 20
+                elif mom > -5:
+                    pts += 10
+            if vol_ratio is not None:
+                if vol_ratio >= 1.5:
+                    pts += 30  # alto interes
+                elif vol_ratio >= 1.0:
+                    pts += 20
+                elif vol_ratio >= 0.7:
+                    pts += 10
+            if sharpe is not None:
+                if sharpe >= 1.5:
+                    pts += 30
+                elif sharpe >= 0.5:
+                    pts += 20
+                elif sharpe >= 0:
+                    pts += 10
+
+        score_num = min(100, max(0, round(pts)))
+        verdict = "OK" if score_num >= 50 else "NOK"
+        if verdict == "OK":
+            ok_count += 1
+
+        rec_str = f"{rec_mean:.1f}({rec_key})" if rec_mean is not None else "N/D"
+        inst_str = f"{inst_pct * 100:.0f}%" if inst_pct else "N/D"
+        short_str = f"{short_pct * 100:.1f}%" if short_pct else "N/D"
+        reason = f"Score {score_num}/100 | Rec {rec_str} | Inst {inst_str} | Short {short_str}."
+        nombre = asset.get("nombre", t)
+        rows.append([str(i), t, nombre, tipo, f"{asset['peso']}%", verdict, reason])
+
+    table = _render_md_table(["#", "Ticker", "Nombre", "Tipo", "%Cartera", "Veredicto", "Institucional detalle"], rows)
+    print("\n[Tabla institucional validada]", flush=True)
+    print(table, flush=True)
+    print(f"\nResultado: {ok_count} OK / {len(top10_assets) - ok_count} NOK de {len(top10_assets)} activos.", flush=True)
+    return table
+
+
 def _parse_verdict_table(table: str) -> dict[str, str]:
     verdicts: dict[str, str] = {}
     lines = [ln.strip() for ln in table.splitlines() if ln.strip().startswith("|")]
@@ -1567,7 +1744,7 @@ def _extract_evitar_tickers(verdict_output: str) -> set[str]:
     return evitar
 
 
-def final_verdict(top10_assets: list[dict[str, Any]], ta_table: str, fa_table: str, risk_table: str, sent_table: str, ew_table: str, macd_table: str) -> str:
+def final_verdict(top10_assets: list[dict[str, Any]], ta_table: str, fa_table: str, risk_table: str, sent_table: str, ew_table: str, macd_table: str, inst_table: str) -> str:
     print("\n" + "=" * 60, flush=True)
     print("VEREDICTO FINAL CONSOLIDADO", flush=True)
     print("=" * 60, flush=True)
@@ -1578,6 +1755,7 @@ def final_verdict(top10_assets: list[dict[str, Any]], ta_table: str, fa_table: s
     sent_map = _parse_verdict_table(sent_table)
     ew_map = _parse_verdict_table(ew_table)
     macd_map = _parse_verdict_table(macd_table)
+    inst_map = _parse_verdict_table(inst_table)
 
     rows: list[list[str]] = []
     buy = watch = avoid = 0
@@ -1591,21 +1769,22 @@ def final_verdict(top10_assets: list[dict[str, Any]], ta_table: str, fa_table: s
         sent = sent_map.get(t, "NOK")
         elliott = ew_map.get(t, "NOK")
         macd = macd_map.get(t, "NOK")
-        ok_total = [tech, fund, risk, sent, elliott, macd].count("OK")
-        if ok_total >= 5:
+        inst = inst_map.get(t, "NOK")
+        ok_total = [tech, fund, risk, sent, elliott, macd, inst].count("OK")
+        if ok_total >= 6:
             decision = "COMPRAR"
             buy += 1
-        elif ok_total >= 3:
+        elif ok_total >= 4:
             decision = "VIGILAR"
             watch += 1
         else:
             decision = "EVITAR"
             avoid += 1
 
-        rows.append([str(i), t, nombre, f"{asset['peso']}%", tech, fund, risk, sent, elliott, macd, decision])
+        rows.append([str(i), t, nombre, f"{asset['peso']}%", tech, fund, risk, sent, elliott, macd, inst, decision])
 
     table = _render_md_table(
-        ["#", "Ticker", "Nombre", "%Cartera", "Tecnico", "Fundamental", "Riesgo", "Sentimiento", "Elliott", "MACD", "DECISION FINAL"],
+        ["#", "Ticker", "Nombre", "%Cartera", "Tecnico", "Fundamental", "Riesgo", "Sentimiento", "Elliott", "MACD", "Institucional", "DECISION FINAL"],
         rows,
     )
 
@@ -1734,6 +1913,12 @@ def run_debate(args: argparse.Namespace) -> int:
         prices=raw_prices,
     )
 
+    inst_table = institutional_analysis_review(
+        top10_assets=top20_assets,
+        fundamentals=raw_fundamentals,
+        prices=raw_prices,
+    )
+
     # Fase 5: Veredicto final consolidado
     verdict_output = final_verdict(
         top10_assets=top20_assets,
@@ -1743,6 +1928,7 @@ def run_debate(args: argparse.Namespace) -> int:
         sent_table=sent_table,
         ew_table=ew_table,
         macd_table=macd_table,
+        inst_table=inst_table,
     )
 
     # Fase 5b: Carteras reales de gurus
@@ -1793,6 +1979,11 @@ def run_debate(args: argparse.Namespace) -> int:
             top10_assets=top20_assets2,
             prices=raw_prices,
         )
+        inst_table2 = institutional_analysis_review(
+            top10_assets=top20_assets2,
+            fundamentals=raw_fundamentals,
+            prices=raw_prices,
+        )
         verdict_output2 = final_verdict(
             top10_assets=top20_assets2,
             ta_table=ta_combined2,
@@ -1801,6 +1992,7 @@ def run_debate(args: argparse.Namespace) -> int:
             sent_table=sent_table2,
             ew_table=ew_table2,
             macd_table=macd_table2,
+            inst_table=inst_table2,
         )
 
         # === TERCERA PASADA: excluir tambien los EVITAR de la pasada 2 ===
@@ -1846,6 +2038,11 @@ def run_debate(args: argparse.Namespace) -> int:
                 top10_assets=top20_assets3,
                 prices=raw_prices,
             )
+            inst_table3 = institutional_analysis_review(
+                top10_assets=top20_assets3,
+                fundamentals=raw_fundamentals,
+                prices=raw_prices,
+            )
             verdict_output3 = final_verdict(
                 top10_assets=top20_assets3,
                 ta_table=ta_combined3,
@@ -1854,6 +2051,7 @@ def run_debate(args: argparse.Namespace) -> int:
                 sent_table=sent_table3,
                 ew_table=ew_table3,
                 macd_table=macd_table3,
+                inst_table=inst_table3,
             )
 
     # Fase 6: Diagrama de arquitectura
