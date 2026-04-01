@@ -1,4 +1,4 @@
-# Debate Macro con 3 Agentes (Ollama local)
+# Debate Macro con 7 Agentes (Ollama local)
 
 Programa en Python que crea un debate en vivo entre tres agentes inspirados en enfoques de:
 
