@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1680" viewBox="0 0 1400 1680" role="img" aria-labelledby="title desc">
+  <title id="title">Flujo del proyecto de debate macro</title>
+  <desc id="desc">Diagrama del flujo entre Streamlit, el motor de debate, las fuentes de datos, los siete agentes, los evaluadores y la salida final.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f6f7fb"/>
+      <stop offset="100%" stop-color="#eef4ea"/>
+    </linearGradient>
+    <linearGradient id="titleBand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#102542"/>
+      <stop offset="100%" stop-color="#1f5c4a"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#385469"/>
+    </marker>
+    <style>
+      .title { font: 700 34px 'Segoe UI', Arial, sans-serif; fill: #ffffff; }
+      .subtitle { font: 500 16px 'Segoe UI', Arial, sans-serif; fill: #dbe7f3; }
+      .section { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #102542; }
+      .label { font: 700 18px 'Segoe UI', Arial, sans-serif; fill: #102542; }
+      .body { font: 500 15px 'Segoe UI', Arial, sans-serif; fill: #274053; }
+      .small { font: 500 13px 'Segoe UI', Arial, sans-serif; fill: #496070; }
+      .chip { font: 700 14px 'Segoe UI', Arial, sans-serif; fill: #0b3b2e; }
+      .box { fill: #ffffff; stroke: #bfd0dc; stroke-width: 2; rx: 18; ry: 18; }
+      .soft { fill: #f8fbfd; stroke: #cbd9e2; stroke-width: 2; rx: 18; ry: 18; }
+      .debate { fill: #fff8ef; stroke: #efc48a; stroke-width: 2; rx: 18; ry: 18; }
+      .data { fill: #eef7ff; stroke: #8ab7dd; stroke-width: 2; rx: 18; ry: 18; }
+      .result { fill: #eef8f0; stroke: #8abc97; stroke-width: 2; rx: 18; ry: 18; }
+      .warn { fill: #fff5f2; stroke: #e2a48f; stroke-width: 2; rx: 18; ry: 18; }
+      .phase { fill: #102542; }
+      .line { stroke: #385469; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .lineSoft { stroke: #6c8394; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 10 8; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="1680" fill="url(#bg)"/>
+  <rect x="40" y="32" width="1320" height="110" rx="28" fill="url(#titleBand)"/>
+  <text x="72" y="82" class="title">Flow Del Proyecto</text>
+  <text x="72" y="114" class="subtitle">Streamlit + Ollama + datos reales de mercado + carteras 13F + debate multiagente + ranking final</text>
+
+  <text x="70" y="195" class="section">1. Entrada y orquestacion</text>
+  <rect x="60" y="220" width="380" height="150" class="box"/>
+  <text x="88" y="260" class="label">streamlit_app.py</text>
+  <text x="88" y="292" class="body">UI para configurar modelo, host, duracion y contexto.</text>
+  <text x="88" y="320" class="body">Lanza el motor con subprocess y muestra el log en vivo.</text>
+  <text x="88" y="348" class="small">Salida: tablas, graficos, historico SQLite y descarga del log.</text>
+
+  <rect x="500" y="220" width="390" height="150" class="soft"/>
+  <text x="528" y="260" class="label">ollama_macro_debate.py</text>
+  <text x="528" y="292" class="body">Motor principal del pipeline.</text>
+  <text x="528" y="320" class="body">Asigna modelos, coordina fases y ejecuta 3 pasadas si hace falta.</text>
+  <text x="528" y="348" class="small">Fases: debate, consenso, Top 20, evaluaciones, veredicto.</text>
+
+  <rect x="950" y="220" width="390" height="150" class="data"/>
+  <text x="978" y="260" class="label">Ollama local</text>
+  <text x="978" y="292" class="body">Modelos LLM usados por agentes y moderadores.</text>
+  <text x="978" y="320" class="body">El sistema resuelve fallback entre modelos disponibles.</text>
+  <text x="978" y="348" class="small">7 agentes de debate + moderadores + veredicto final.</text>
+
+  <path d="M 440 295 L 500 295" class="line"/>
+  <path d="M 890 295 L 950 295" class="line"/>
+
+  <text x="70" y="455" class="section">2. Fuentes de datos reales</text>
+  <rect x="60" y="480" width="620" height="170" class="data"/>
+  <text x="88" y="520" class="label">market_data.py</text>
+  <text x="88" y="552" class="body">Descarga precios, momentum, RSI, MACD, volatilidad y fundamentales via yfinance.</text>
+  <text x="88" y="580" class="body">Construye briefings para el debate y datasets crudos para Top 20 y evaluaciones.</text>
+  <text x="88" y="608" class="small">Incluye cache local para reducir latencia y repeticiones.</text>
+  <text x="470" y="520" class="chip">yfinance</text>
+  <text x="470" y="548" class="chip">precios</text>
+  <text x="470" y="576" class="chip">fundamentales</text>
+  <text x="470" y="604" class="chip">tecnico</text>
+
+  <rect x="720" y="480" width="620" height="170" class="data"/>
+  <text x="748" y="520" class="label">guru_holdings.py</text>
+  <text x="748" y="552" class="body">Descarga carteras reales 13F desde SEC EDGAR y cruza posiciones con el universo del sistema.</text>
+  <text x="748" y="580" class="body">Calcula el guru conviction score para reforzar activos con apoyo institucional real.</text>
+  <text x="748" y="608" class="small">Buffett, Druckenmiller, Dalio, Cathie Wood y Howard Marks.</text>
+  <text x="1180" y="520" class="chip">SEC EDGAR</text>
+  <text x="1180" y="548" class="chip">13F</text>
+  <text x="1180" y="576" class="chip">conviction</text>
+  <text x="1180" y="604" class="chip">cache</text>
+
+  <path d="M 615 370 L 615 480" class="lineSoft"/>
+  <path d="M 825 370 L 825 480" class="lineSoft"/>
+
+  <text x="70" y="735" class="section">3. Debate y sintesis</text>
+  <rect x="60" y="760" width="1280" height="250" class="debate"/>
+  <text x="88" y="800" class="label">Fase 1: debate en vivo con 7 agentes</text>
+  <text x="88" y="832" class="body">Buffett, Lynch, Druckenmiller, Dalio, Cathie Wood, Howard Marks y Jim Rogers.</text>
+  <text x="88" y="860" class="body">Cada turno usa contexto reciente del transcript y datos reales para proponer activos concretos.</text>
+  <text x="88" y="888" class="small">Salida intermedia: transcript del debate en streaming.</text>
+
+  <rect x="110" y="915" width="250" height="58" class="soft"/>
+  <text x="135" y="951" class="body">Transcript compartido</text>
+
+  <rect x="425" y="900" width="300" height="84" class="box"/>
+  <text x="450" y="934" class="label">Fase 2: Moderador consenso</text>
+  <text x="450" y="962" class="small">Resume el debate en 10 lineas macro.</text>
+
+  <rect x="820" y="900" width="380" height="84" class="box"/>
+  <text x="845" y="934" class="label">Fase 3: Moderador Top 20</text>
+  <text x="845" y="962" class="small">Propone 20 activos y pesos de cartera que suman 100%.</text>
+
+  <path d="M 360 944 L 425 944" class="line"/>
+  <path d="M 360 944 L 820 944" class="line"/>
+  <path d="M 370 860 C 410 860, 410 944, 425 944" class="lineSoft dashed"/>
+  <path d="M 665 650 C 665 715, 210 715, 210 760" class="lineSoft"/>
+  <path d="M 1030 650 C 1030 715, 1190 715, 1190 760" class="lineSoft"/>
+
+  <text x="70" y="1095" class="section">4. Evaluacion paralela del Top 20</text>
+  <rect x="60" y="1120" width="1280" height="280" class="soft"/>
+  <text x="88" y="1160" class="label">Fase 4: bloques de evaluacion independientes</text>
+  <text x="88" y="1188" class="body">Cada modulo revisa el mismo Top 20 con reglas distintas y genera tablas OK/NOK o scoring especifico.</text>
+
+  <rect x="100" y="1230" width="180" height="110" class="box"/>
+  <text x="126" y="1272" class="body">Tecnico</text>
+  <text x="126" y="1300" class="small">RSI, medias, volatilidad</text>
+
+  <rect x="305" y="1230" width="180" height="110" class="box"/>
+  <text x="331" y="1272" class="body">Ondas Elliott</text>
+  <text x="331" y="1300" class="small">fase, targets, estructura</text>
+
+  <rect x="510" y="1230" width="180" height="110" class="box"/>
+  <text x="536" y="1272" class="body">Fundamental</text>
+  <text x="536" y="1300" class="small">PER, ROE, FCF, deuda</text>
+
+  <rect x="715" y="1230" width="180" height="110" class="box"/>
+  <text x="741" y="1272" class="body">Riesgo</text>
+  <text x="741" y="1300" class="small">vol, drawdown, VaR</text>
+
+  <rect x="920" y="1230" width="180" height="110" class="box"/>
+  <text x="946" y="1272" class="body">Sentimiento</text>
+  <text x="946" y="1300" class="small">flujos, short interest</text>
+
+  <rect x="1125" y="1230" width="180" height="110" class="box"/>
+  <text x="1151" y="1272" class="body">MACD e institucional</text>
+  <text x="1151" y="1300" class="small">momentum + apoyo de fondos</text>
+
+  <path d="M 1010 984 L 1010 1120" class="line"/>
+  <path d="M 1010 1188 C 1010 1210, 190 1210, 190 1230" class="lineSoft"/>
+  <path d="M 1010 1188 C 1010 1210, 395 1210, 395 1230" class="lineSoft"/>
+  <path d="M 1010 1188 C 1010 1210, 600 1210, 600 1230" class="lineSoft"/>
+  <path d="M 1010 1188 C 1010 1210, 805 1210, 805 1230" class="lineSoft"/>
+  <path d="M 1010 1188 C 1010 1210, 1010 1210, 1010 1230" class="lineSoft"/>
+  <path d="M 1010 1188 C 1010 1210, 1215 1210, 1215 1230" class="lineSoft"/>
+
+  <text x="70" y="1485" class="section">5. Consolidacion y salida final</text>
+  <rect x="60" y="1510" width="520" height="120" class="warn"/>
+  <text x="88" y="1550" class="label">Fase 5: final_verdict()</text>
+  <text x="88" y="1582" class="body">Combina las tablas y marca COMPRAR, VIGILAR o EVITAR por activo.</text>
+  <text x="88" y="1610" class="small">Si hay EVITAR, relanza una segunda y hasta una tercera pasada sin esos tickers.</text>
+
+  <rect x="640" y="1510" width="700" height="120" class="result"/>
+  <text x="668" y="1550" class="label">Resultado mostrado en Streamlit</text>
+  <text x="668" y="1582" class="body">Conclusiones macro, Top 20/Top 10, scorecards, tablas por evaluador, graficos y coincidencias con gurus.</text>
+  <text x="668" y="1610" class="small">Tambien guarda historico y permite descargar el log completo.</text>
+
+  <path d="M 190 1340 C 190 1450, 320 1450, 320 1510" class="lineSoft"/>
+  <path d="M 395 1340 C 395 1450, 320 1450, 320 1510" class="lineSoft"/>
+  <path d="M 600 1340 C 600 1450, 320 1450, 320 1510" class="lineSoft"/>
+  <path d="M 805 1340 C 805 1450, 320 1450, 320 1510" class="lineSoft"/>
+  <path d="M 1010 1340 C 1010 1450, 320 1450, 320 1510" class="lineSoft"/>
+  <path d="M 1215 1340 C 1215 1450, 320 1450, 320 1510" class="lineSoft"/>
+  <path d="M 580 1570 L 640 1570" class="line"/>
+  <path d="M 905 1630 C 905 1660, 320 1660, 320 1630" class="lineSoft dashed"/>
+
+  <text x="1110" y="1660" class="small">Version resumida del flujo real del proyecto</text>
+</svg>

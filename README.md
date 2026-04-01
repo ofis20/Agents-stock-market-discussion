@@ -1,12 +1,37 @@
 # Debate Macro con 7 Agentes (Ollama local)
 
-Programa en Python que crea un debate en vivo entre tres agentes inspirados en enfoques de:
+Aplicacion en Python que ejecuta un debate de inversion con 7 agentes inspirados en gestores legendarios, alimentado con datos reales de mercado, carteras 13F y una capa final de evaluacion tecnica, fundamental, de riesgo, sentimiento e institucional.
+
+Participantes del debate:
 
 - Warren Buffett (valor y largo plazo)
 - Peter Lynch (crecimiento entendible)
 - Stanley Druckenmiller (macro y liquidez)
+- Ray Dalio (ciclos y All Weather)
+- Cathie Wood (innovacion disruptiva)
+- Howard Marks (credito y ciclos)
+- Jim Rogers (commodities y mercados globales)
 
-Tras un tiempo objetivo (por defecto 50 segundos), el sistema fuerza un consenso final y muestra un resumen de 10 lineas.
+El sistema genera:
+
+- Debate en vivo con transcript completo
+- Consenso macro sintetizado
+- Top 20 de inversiones con pesos
+- Evaluaciones independientes por activo
+- Veredicto final con etiquetas `COMPRAR`, `VIGILAR` o `EVITAR`
+- Visualizacion en Streamlit con tablas, graficos e historico
+
+## Flujo Del Proyecto
+
+### Vista Ejecutiva
+
+![Flujo ejecutivo del proyecto](assets/project-flow-overview.svg)
+
+### Vista Tecnica
+
+![Flujo tecnico del proyecto](assets/project-flow.svg)
+
+Tras un tiempo objetivo, el sistema fuerza un consenso, construye el ranking de activos y ejecuta hasta tres pasadas para depurar activos descartados.
 
 ## Requisitos
 
