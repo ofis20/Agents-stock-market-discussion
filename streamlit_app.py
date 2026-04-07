@@ -15,8 +15,18 @@ from pathlib import Path
 import altair as alt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+
+from debate_portfolio import classify_elliott_wave, find_zigzag_pivots
+from market_data import TICKERS as _TICKER_DB
+
+
+def _ticker_label(ticker: str) -> str:
+    """Devuelve 'AAPL — Apple' o solo el ticker si no hay nombre."""
+    name = _TICKER_DB.get(ticker, {}).get("nombre", "")
+    return f"{ticker} — {name}" if name else ticker
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -31,6 +41,8 @@ SECTION_HINTS = {
     "REVISION DE SENTIMIENTO DE MERCADO": "Sentimiento de mercado",
     "REVISION DE MACD": "MACD",
     "REVISION INSTITUCIONAL": "Institucional",
+    "REVISION WYCKOFF": "Wyckoff",
+    "REVISION ANALISIS RELATIVO": "Analisis relativo",
     "CARTERAS REALES DE GURUS": "Carteras de Gurus",
     "VEREDICTO FINAL CONSOLIDADO": "Veredicto final",
 }
@@ -51,8 +63,52 @@ def _extract_percent_value(value: str) -> float:
     return float(match.group(1)) if match else 0.0
 
 
-def build_command(model: str, host: str, seconds: int, max_turns: int, context_lines: int) -> list[str]:
-    return [
+def extract_timer_block(text: str) -> list[dict[str, str]] | None:
+    """Extrae las etapas del cronometro de ejecucion del output."""
+    marker = "CRONOMETRO DE EJECUCION"
+    pos = text.find(marker)
+    if pos == -1:
+        return None
+    block = text[pos:]
+    end = block.find("\n=" * 1)
+    # Find closing === line after the content
+    lines = block.splitlines()
+    stages: list[dict[str, str]] = []
+    for ln in lines[2:]:  # skip header and === line
+        ln = ln.strip()
+        if ln.startswith("="):
+            break
+        if not ln or ln.startswith("─"):
+            continue
+        # Match: "  Nombre etapa          123.4s  (12.3%) ████"
+        m = re.match(r"(.+?)\s{2,}([\d.]+)s\s+\(([\d.]+)%\)", ln)
+        if m:
+            stages.append({"etapa": m.group(1).strip(), "segundos": m.group(2), "pct": m.group(3)})
+        # Match TOTAL line
+        mt = re.match(r"TOTAL\s+([\d.]+)s\s+\((\d+m\s*\d+s)\)", ln)
+        if mt:
+            stages.append({"etapa": "TOTAL", "segundos": mt.group(1), "pct": mt.group(2)})
+    return stages if stages else None
+
+
+def render_timer(full_output: str) -> None:
+    """Renderiza el cronometro de ejecucion como tabla en Streamlit."""
+    stages = extract_timer_block(full_output)
+    if not stages:
+        return
+    st.subheader("Cronometro de ejecucion")
+    rows = []
+    for s in stages:
+        if s["etapa"] == "TOTAL":
+            rows.append({"Etapa": "**TOTAL**", "Tiempo": f"{s['segundos']}s", "%": s["pct"]})
+        else:
+            rows.append({"Etapa": s["etapa"], "Tiempo": f"{s['segundos']}s", "%": f"{s['pct']}%"})
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def build_command(model: str, host: str, seconds: int, max_turns: int, context_lines: int, portfolio: str = "") -> list[str]:
+    cmd = [
         sys.executable,
         "-u",
         str(SCRIPT_PATH),
@@ -67,6 +123,9 @@ def build_command(model: str, host: str, seconds: int, max_turns: int, context_l
         "--context-lines",
         str(context_lines),
     ]
+    if portfolio:
+        cmd.extend(["--portfolio", portfolio])
+    return cmd
 
 
 def inject_app_css() -> None:
@@ -107,21 +166,27 @@ def render_wrapped_log(target, text: str) -> None:
     )
 
 
+_RE_AGENT_TURN = re.compile(r"^\[(.+?)\]\s*\(modelo:\s*(.+?)\)")
+_RE_MODEL_MAP = re.compile(r"^\s{2}(.+?)\s+->\s+(.+)$")
+
+
 def _detect_phase(line: str) -> str | None:
     upper = line.upper()
     if "CARGANDO DATOS REALES" in upper:
         return "Cargando datos de mercado..."
     if "DATOS DE MERCADO CARGADOS DESDE CACHE" in upper:
         return "Datos cargados desde cache..."
-    if "DEBATE EN VIVO" in upper or line.startswith("[") and "] (modelo:" in line:
+    if "DEBATE EN VIVO" in upper:
         return "Debate en curso..."
+    # Turno de agente: [Nombre] (modelo: xxx) — se gestiona aparte
+    if _RE_AGENT_TURN.match(line):
+        return "__agent_turn__"
     if "SEGUNDA PASADA" in upper:
         return "Segunda pasada (sin EVITAR)..."
     if "TERCERA PASADA" in upper:
         return "Tercera pasada (filtrado final)..."
     if "TOP 20 INVERSIONES" in upper:
         return "Generando Top 20..."
-    # Progreso de evaluaciones: [Evaluando X/N: TICKER]
     m = re.match(r"\[Evaluando (\d+)/(\d+): (\S+)\]", line)
     if m:
         return f"Evaluando activo {m.group(1)}/{m.group(2)}: {m.group(3)}"
@@ -143,7 +208,9 @@ def _detect_phase(line: str) -> str | None:
 def stream_process(cmd: list[str]) -> tuple[int, str]:
     full_output = ""
     phase_label = st.empty()
+    model_label = st.empty()
     current_phase = "Iniciando..."
+    model_map: dict[str, str] = {}
 
     with st.status("Ejecutando analisis...", expanded=True) as status:
         phase_label.info(current_phase)
@@ -172,10 +239,45 @@ def stream_process(cmd: list[str]) -> tuple[int, str]:
 
             if "\n" in line_buffer:
                 for ln in line_buffer.splitlines():
+                    # Capturar mapa de modelos del inicio
+                    mm = _RE_MODEL_MAP.match(ln)
+                    if mm:
+                        model_map[mm.group(1).strip()] = mm.group(2).strip()
+                        continue
+
                     detected = _detect_phase(ln)
-                    if detected and detected != current_phase:
+                    if not detected or detected == current_phase:
+                        continue
+
+                    # Turno de agente → mostrar nombre + modelo
+                    if detected == "__agent_turn__":
+                        am = _RE_AGENT_TURN.match(ln)
+                        if am:
+                            agent_name, agent_model = am.group(1), am.group(2)
+                            current_phase = f"Debate: {agent_name}"
+                            phase_label.info(f"Fase actual: Debate en curso...")
+                            model_label.caption(
+                                f"🎙️ **{agent_name}** — `{agent_model}`"
+                            )
+                    else:
                         current_phase = detected
                         phase_label.info(f"Fase actual: {current_phase}")
+                        # Mostrar modelo asignado si la fase tiene uno
+                        _phase_role_map = {
+                            "Segunda pasada (sin EVITAR)...": "Moderador Consenso",
+                            "Tercera pasada (filtrado final)...": "Moderador Consenso",
+                            "Generando Top 20...": "Moderador Top 20",
+                            "Veredicto final...": "Veredicto Final",
+                        }
+                        role = _phase_role_map.get(current_phase, "")
+                        if role and role in model_map:
+                            model_label.caption(
+                                f"🤖 **{role}** — `{model_map[role]}`"
+                            )
+                        elif "Evaluando" in current_phase or "Analisis" in current_phase or "Gestion" in current_phase or "Sentimiento" in current_phase or "institucional" in current_phase:
+                            model_label.caption("📊 Evaluador determinista (sin LLM)")
+                        else:
+                            model_label.empty()
                 line_buffer = ""
 
         return_code = process.wait()
@@ -596,7 +698,7 @@ def render_scoreboard(score_df: pd.DataFrame) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
-def _render_pass_summary(output: str) -> None:
+def _render_pass_summary(output: str, pass_id: str = "p1") -> None:
     """Renderiza el resumen de una pasada (top 20, charts, recos, scoreboard, heatmap, stop-loss)."""
     tables = extract_named_tables(output)
     top10_df = extract_top10_table(output)
@@ -618,10 +720,25 @@ def _render_pass_summary(output: str) -> None:
             st.markdown(f"- {reco}")
 
     render_scoreboard(score_df)
+    render_run_deltas(score_df)
     render_heatmap(score_df)
+    render_candlestick(top10_df, score_df, pass_id=pass_id)
     render_stop_loss(top10_df, score_df)
     render_backtest(top10_df)
     render_correlation(top10_df)
+
+    # Export CSV del scoreboard con deltas
+    if not score_df.empty:
+        previous_df = _load_previous_scoreboard()
+        export_df = compute_run_deltas(score_df, previous_df) if not previous_df.empty else score_df.copy()
+        csv_data = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Descargar scoreboard (CSV)",
+            data=csv_data,
+            file_name=f"scoreboard_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            key=f"csv_export_{pass_id}",
+        )
 
     # Alertas de datos incompletos
     warnings = _extract_data_warnings(output)
@@ -665,18 +782,51 @@ def _init_db() -> None:
             full_output TEXT
         )
     """)
+    # Migrar: anadir columna prices_json si no existe
+    cursor = conn.execute("PRAGMA table_info(runs)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "prices_json" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN prices_json TEXT")
     conn.commit()
     conn.close()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_current_prices(tickers: tuple[str, ...]) -> dict[str, float]:
+    """Obtiene el precio actual de una lista de tickers."""
+    prices: dict[str, float] = {}
+    if not tickers:
+        return prices
+    try:
+        data = yf.download(list(tickers), period="5d", progress=False)
+        if data.empty:
+            return prices
+        close = data["Close"]
+        if len(tickers) == 1:
+            last = close.dropna().iloc[-1] if not close.dropna().empty else None
+            if last is not None:
+                prices[tickers[0]] = float(last)
+        else:
+            for t in tickers:
+                if t in close.columns:
+                    s = close[t].dropna()
+                    if not s.empty:
+                        prices[t] = float(s.iloc[-1])
+    except Exception:
+        pass
+    return prices
 
 
 def _save_run(model: str, score_df: pd.DataFrame, full_output: str) -> None:
     _init_db()
     tickers = score_df["Ticker"].tolist() if not score_df.empty else []
     sb_json = score_df.to_json(orient="records") if not score_df.empty else "[]"
+    # Capturar precios al momento de la recomendacion
+    prices_at_rec = _fetch_current_prices(tuple(tickers)) if tickers else {}
     conn = sqlite3.connect(str(HISTORY_DB))
     conn.execute(
-        "INSERT INTO runs (timestamp, model, tickers_json, scoreboard_json, full_output) VALUES (?, ?, ?, ?, ?)",
-        (datetime.now().isoformat(), model, json.dumps(tickers), sb_json, full_output),
+        "INSERT INTO runs (timestamp, model, tickers_json, scoreboard_json, full_output, prices_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(), model, json.dumps(tickers), sb_json, full_output, json.dumps(prices_at_rec)),
     )
     conn.commit()
     conn.close()
@@ -688,6 +838,245 @@ def _load_history() -> pd.DataFrame:
     df = pd.read_sql_query("SELECT id, timestamp, model, tickers_json, scoreboard_json FROM runs ORDER BY id DESC LIMIT 20", conn)
     conn.close()
     return df
+
+
+def _load_previous_scoreboard() -> pd.DataFrame:
+    """Carga el scoreboard de la ejecucion anterior (la mas reciente guardada)."""
+    _init_db()
+    conn = sqlite3.connect(str(HISTORY_DB))
+    row = conn.execute(
+        "SELECT scoreboard_json FROM runs WHERE scoreboard_json IS NOT NULL AND scoreboard_json != '[]' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return pd.DataFrame()
+    try:
+        return pd.read_json(row[0], orient="records")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_scoreboard_history(limit: int = 10) -> list[pd.DataFrame]:
+    """Carga los scoreboards de las ultimas N ejecuciones (mas reciente primero)."""
+    history = _load_scoreboard_history_with_dates(limit)
+    return [df for _, df in history]
+
+
+def _load_scoreboard_history_with_dates(limit: int = 10) -> list[tuple[str, pd.DataFrame]]:
+    """Carga (timestamp, scoreboard) de las ultimas N ejecuciones (mas reciente primero)."""
+    _init_db()
+    conn = sqlite3.connect(str(HISTORY_DB))
+    rows = conn.execute(
+        "SELECT timestamp, scoreboard_json FROM runs WHERE scoreboard_json IS NOT NULL AND scoreboard_json != '[]' ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    result: list[tuple[str, pd.DataFrame]] = []
+    for ts, sb_json in rows:
+        try:
+            df = pd.read_json(sb_json, orient="records")
+            if not df.empty:
+                result.append((ts, df))
+        except Exception:
+            continue
+    return result
+
+
+_DECISION_RANK = {"COMPRAR": 3, "VIGILAR": 2, "EVITAR": 1}
+
+
+def compute_run_deltas(current_df: pd.DataFrame, previous_df: pd.DataFrame) -> pd.DataFrame:
+    """Compara el scoreboard actual con el anterior y anade columnas de cambio."""
+    if current_df.empty:
+        return current_df
+
+    result = current_df.copy()
+
+    if previous_df.empty:
+        result["Estado"] = "NUEVA"
+        result["Anterior"] = "-"
+        return result
+
+    prev_decisions: dict[str, str] = {}
+    if "Ticker" in previous_df.columns and "Decision sugerida" in previous_df.columns:
+        prev_decisions = dict(zip(
+            previous_df["Ticker"].astype(str).str.upper(),
+            previous_df["Decision sugerida"].astype(str).str.upper(),
+        ))
+
+    estados = []
+    anteriores = []
+    for _, row in result.iterrows():
+        ticker = str(row["Ticker"]).upper()
+        current_decision = str(row.get("Decision sugerida", "")).upper()
+        prev_decision = prev_decisions.get(ticker)
+
+        if prev_decision is None:
+            estados.append("NUEVA")
+            anteriores.append("-")
+        else:
+            anteriores.append(prev_decision)
+            curr_rank = _DECISION_RANK.get(current_decision, 0)
+            prev_rank = _DECISION_RANK.get(prev_decision, 0)
+            if curr_rank > prev_rank:
+                estados.append("SUBE")
+            elif curr_rank < prev_rank:
+                estados.append("BAJA")
+            else:
+                estados.append("MANTIENE")
+
+    result["Estado"] = estados
+    result["Anterior"] = anteriores
+    return result
+
+
+def compute_conviction_days(current_df: pd.DataFrame, history: list[tuple[str, pd.DataFrame]]) -> dict[str, int]:
+    """Calcula cuantos dias lleva un ticker apareciendo consecutivamente como COMPRAR."""
+    streaks: dict[str, int] = {}
+    if current_df.empty:
+        return streaks
+
+    today = datetime.now()
+
+    for _, row in current_df.iterrows():
+        ticker = str(row["Ticker"]).upper()
+        decision = str(row.get("Decision sugerida", "")).upper()
+        if decision != "COMPRAR":
+            streaks[ticker] = 0
+            continue
+        # Buscar la ejecucion mas antigua consecutiva con COMPRAR
+        oldest_ts = today
+        for ts_str, past_df in history:
+            if past_df.empty or "Ticker" not in past_df.columns:
+                break
+            past_decisions = dict(zip(
+                past_df["Ticker"].astype(str).str.upper(),
+                past_df["Decision sugerida"].astype(str).str.upper() if "Decision sugerida" in past_df.columns else pd.Series(dtype=str),
+            ))
+            if past_decisions.get(ticker) == "COMPRAR":
+                try:
+                    oldest_ts = datetime.fromisoformat(ts_str)
+                except (ValueError, TypeError):
+                    pass
+            else:
+                break
+        days = max(1, (today - oldest_ts).days)
+        streaks[ticker] = days
+
+    return streaks
+
+
+def _find_exited_tickers(current_df: pd.DataFrame, previous_df: pd.DataFrame) -> list[dict[str, str]]:
+    """Encuentra tickers que estaban en la ejecucion anterior pero ya no estan."""
+    if previous_df.empty or current_df.empty:
+        return []
+    current_tickers = set(current_df["Ticker"].astype(str).str.upper())
+    exited = []
+    for _, row in previous_df.iterrows():
+        ticker = str(row["Ticker"]).upper()
+        if ticker not in current_tickers:
+            decision = str(row.get("Decision sugerida", "?"))
+            exited.append({"Ticker": ticker, "Decision anterior": decision})
+    return exited
+
+
+def render_run_deltas(score_df: pd.DataFrame) -> None:
+    """Renderiza la seccion de cambios respecto a la ejecucion anterior."""
+    previous_df = _load_previous_scoreboard()
+    if previous_df.empty:
+        st.info("No hay ejecucion anterior para comparar. Los cambios se mostraran a partir de la proxima ejecucion.")
+        return
+
+    delta_df = compute_run_deltas(score_df, previous_df)
+    if "Estado" not in delta_df.columns:
+        st.info("No se pudo calcular el delta (scoreboard vacío).")
+        return
+    history_with_dates = _load_scoreboard_history_with_dates(10)
+    streaks = compute_conviction_days(score_df, history_with_dates)
+
+    # Resumen rapido de movimientos
+    st.subheader("Cambios vs ejecucion anterior")
+
+    nuevas = int((delta_df["Estado"] == "NUEVA").sum())
+    suben = int((delta_df["Estado"] == "SUBE").sum())
+    bajan = int((delta_df["Estado"] == "BAJA").sum())
+    mantienen = int((delta_df["Estado"] == "MANTIENE").sum())
+    exited = _find_exited_tickers(score_df, previous_df)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Nuevas", nuevas)
+    c2.metric("Suben", suben)
+    c3.metric("Bajan", bajan)
+    c4.metric("Mantienen", mantienen)
+    c5.metric("Salen", len(exited))
+
+    # Tabla de cambios con colores
+    display_cols = ["Ticker"]
+    if "Nombre" in delta_df.columns:
+        display_cols.append("Nombre")
+    display_cols += ["Decision sugerida", "Anterior", "Estado", "Puntaje"]
+    display_cols = [c for c in display_cols if c in delta_df.columns]
+    change_df = delta_df[display_cols].copy()
+
+    # Anadir columna de conviccion (dias consecutivos como COMPRAR)
+    if streaks:
+        change_df["Conviccion"] = change_df["Ticker"].map(
+            lambda t: f"{streaks.get(t.upper(), 0)}d" if streaks.get(t.upper(), 0) >= 2 else "-"
+        )
+
+    def _color_estado(val: str) -> str:
+        v = str(val).upper()
+        if v == "NUEVA":
+            return "background-color: #dbeafe; color: #1e40af; font-weight: 600;"
+        if v == "SUBE":
+            return "background-color: #e8f7ea; color: #166534; font-weight: 600;"
+        if v == "BAJA":
+            return "background-color: #fdeaea; color: #991b1b; font-weight: 600;"
+        if v == "MANTIENE":
+            return "background-color: #f3f4f6; color: #374151;"
+        return ""
+
+    styled = change_df.style.map(_color_estado, subset=["Estado"])
+    if "Decision sugerida" in change_df.columns:
+        def _color_decision(val: str) -> str:
+            v = str(val).upper()
+            if "COMPRAR" in v:
+                return "background-color: #e8f7ea; color: #166534; font-weight: 600;"
+            if "VIGILAR" in v:
+                return "background-color: #fff7e6; color: #9a6700; font-weight: 600;"
+            if "EVITAR" in v:
+                return "background-color: #fdeaea; color: #991b1b; font-weight: 600;"
+            return ""
+        styled = styled.map(_color_decision, subset=["Decision sugerida"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # Detalle de movimientos relevantes
+    if suben > 0:
+        sube_df = delta_df[delta_df["Estado"] == "SUBE"]
+        st.success("**Suben de nivel:** " + ", ".join(
+            f"{row['Ticker']} ({row['Anterior']} -> {row['Decision sugerida']})"
+            for _, row in sube_df.iterrows()
+        ))
+
+    if bajan > 0:
+        baja_df = delta_df[delta_df["Estado"] == "BAJA"]
+        st.warning("**Bajan de nivel:** " + ", ".join(
+            f"{row['Ticker']} ({row['Anterior']} -> {row['Decision sugerida']})"
+            for _, row in baja_df.iterrows()
+        ))
+
+    if exited:
+        st.error("**Salen del Top 20:** " + ", ".join(
+            f"{e['Ticker']} (era {e['Decision anterior']})"
+            for e in exited
+        ))
+
+    # Conviccion alta
+    high_conviction = {t: s for t, s in streaks.items() if s >= 3}
+    if high_conviction:
+        st.info("**Conviccion alta** (COMPRAR durante 3+ dias consecutivos): " + ", ".join(
+            f"{t} ({s}d)" for t, s in sorted(high_conviction.items(), key=lambda x: -x[1])
+        ))
 
 
 def render_history_tab() -> None:
@@ -705,6 +1094,353 @@ def render_history_tab() -> None:
                 if not sb.empty:
                     st.dataframe(style_table(sb), use_container_width=True, hide_index=True)
             st.caption(f"Tickers: {', '.join(tickers[:20])}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. ALERTAS DE PRECIO
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_runs_with_prices(limit: int = 10) -> list[dict]:
+    """Carga las ultimas ejecuciones con precios y scoreboards."""
+    _init_db()
+    conn = sqlite3.connect(str(HISTORY_DB))
+    rows = conn.execute(
+        "SELECT timestamp, scoreboard_json, prices_json FROM runs "
+        "WHERE scoreboard_json IS NOT NULL AND scoreboard_json != '[]' "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    result = []
+    for ts, sb_json, prices_json in rows:
+        try:
+            sb = pd.read_json(sb_json, orient="records")
+            prices = json.loads(prices_json) if prices_json else {}
+            if not sb.empty:
+                result.append({"timestamp": ts, "scoreboard": sb, "prices": prices})
+        except Exception:
+            continue
+    return result
+
+
+def render_price_alerts() -> None:
+    """Muestra alertas comparando precios de recomendacion vs precios actuales."""
+    st.subheader("Alertas de precio")
+    st.caption("Compara el precio al momento de la recomendacion COMPRAR con el precio actual.")
+
+    runs = _load_runs_with_prices(5)
+    if not runs:
+        st.info("No hay ejecuciones con datos de precio guardados. Las alertas apareceran despues de la proxima ejecucion.")
+        return
+
+    # Recopilar las recomendaciones COMPRAR mas recientes por ticker
+    buy_recs: dict[str, dict] = {}  # ticker -> {price, timestamp, decision}
+    for run_data in runs:
+        sb = run_data["scoreboard"]
+        prices = run_data["prices"]
+        ts = run_data["timestamp"][:19].replace("T", " ")
+        if "Decision sugerida" not in sb.columns:
+            continue
+        for _, row in sb.iterrows():
+            ticker = str(row["Ticker"]).upper()
+            decision = str(row.get("Decision sugerida", "")).upper()
+            if decision == "COMPRAR" and ticker not in buy_recs and ticker in prices:
+                buy_recs[ticker] = {
+                    "precio_rec": prices[ticker],
+                    "timestamp": ts,
+                    "puntaje": int(row.get("Puntaje", 0)),
+                }
+
+    if not buy_recs:
+        st.info("No hay recomendaciones COMPRAR con precios de referencia guardados.")
+        return
+
+    # Obtener precios actuales
+    current_prices = _fetch_current_prices(tuple(buy_recs.keys()))
+    if not current_prices:
+        st.warning("No se pudieron obtener precios actuales.")
+        return
+
+    alert_rows = []
+    for ticker, rec in sorted(buy_recs.items()):
+        if ticker not in current_prices:
+            continue
+        price_rec = rec["precio_rec"]
+        price_now = current_prices[ticker]
+        if price_rec <= 0:
+            continue
+        change_pct = ((price_now - price_rec) / price_rec) * 100
+
+        # Clasificar la alerta
+        if change_pct >= 20:
+            alerta = "TOMAR BENEFICIOS"
+        elif change_pct >= 10:
+            alerta = "EN GANANCIA"
+        elif change_pct >= -5:
+            alerta = "ESTABLE"
+        elif change_pct >= -15:
+            alerta = "EN PERDIDA"
+        else:
+            alerta = "STOP-LOSS"
+
+        alert_rows.append({
+            "Ticker": ticker,
+            "Recomendado": rec["timestamp"],
+            "Precio rec.": f"${price_rec:.2f}",
+            "Precio actual": f"${price_now:.2f}",
+            "Cambio %": f"{change_pct:+.1f}%",
+            "Alerta": alerta,
+            "Puntaje": f"{rec['puntaje']}/7",
+            "_change": change_pct,
+        })
+
+    if not alert_rows:
+        st.info("No se pudieron calcular alertas de precio.")
+        return
+
+    alert_df = pd.DataFrame(alert_rows).sort_values("_change", ascending=False)
+    display_df = alert_df.drop(columns=["_change"])
+
+    # Metricas resumen
+    gains = sum(1 for r in alert_rows if r["_change"] > 0)
+    losses = sum(1 for r in alert_rows if r["_change"] < 0)
+    avg_change = sum(r["_change"] for r in alert_rows) / len(alert_rows)
+    stop_alerts = sum(1 for r in alert_rows if r["Alerta"] == "STOP-LOSS")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("En ganancia", gains)
+    c2.metric("En perdida", losses)
+    c3.metric("Cambio medio", f"{avg_change:+.1f}%")
+    c4.metric("Alertas stop", stop_alerts)
+
+    def _color_alerta(val: str) -> str:
+        v = str(val).upper()
+        if v == "TOMAR BENEFICIOS":
+            return "background-color: #dbeafe; color: #1e40af; font-weight: 600;"
+        if v == "EN GANANCIA":
+            return "background-color: #e8f7ea; color: #166534; font-weight: 600;"
+        if v == "ESTABLE":
+            return "background-color: #f3f4f6; color: #374151;"
+        if v == "EN PERDIDA":
+            return "background-color: #fff7e6; color: #9a6700; font-weight: 600;"
+        if v == "STOP-LOSS":
+            return "background-color: #fdeaea; color: #991b1b; font-weight: 600;"
+        return ""
+
+    styled = display_df.style.map(_color_alerta, subset=["Alerta"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # Alertas criticas
+    stops = [r for r in alert_rows if r["Alerta"] == "STOP-LOSS"]
+    if stops:
+        st.error("**ALERTA STOP-LOSS:** " + ", ".join(
+            f"{r['Ticker']} ({r['Cambio %']})"
+            for r in stops
+        ))
+
+    takes = [r for r in alert_rows if r["Alerta"] == "TOMAR BENEFICIOS"]
+    if takes:
+        st.success("**Considerar tomar beneficios:** " + ", ".join(
+            f"{r['Ticker']} ({r['Cambio %']})"
+            for r in takes
+        ))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3c. DASHBOARD MULTI-EJECUCION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def render_dashboard() -> None:
+    """Dashboard con evolucion de scores y decisiones a lo largo de ejecuciones."""
+    st.subheader("Dashboard multi-ejecucion")
+    st.caption("Evolucion de puntajes y decisiones de los activos a lo largo de las ejecuciones.")
+
+    history_wd = _load_scoreboard_history_with_dates(20)
+    if len(history_wd) < 2:
+        st.info("Se necesitan al menos 2 ejecuciones para mostrar el dashboard. Ejecuta el analisis varias veces.")
+        return
+
+    # Revertir para orden cronologico (mas antigua primero)
+    history_wd = list(reversed(history_wd))
+    history = [df for _, df in history_wd]
+
+    # Construir datos de evolucion
+    all_tickers: set[str] = set()
+    for df in history:
+        if "Ticker" in df.columns:
+            all_tickers.update(df["Ticker"].astype(str).str.upper().tolist())
+
+    # Contar en cuantas ejecuciones aparece cada ticker
+    ticker_freq = {}
+    for t in all_tickers:
+        count = sum(1 for df in history if t in df["Ticker"].astype(str).str.upper().values)
+        ticker_freq[t] = count
+
+    # Solo mostrar tickers que aparecen en al menos 2 ejecuciones
+    relevant_tickers = sorted([t for t, c in ticker_freq.items() if c >= 2], key=lambda t: -ticker_freq[t])
+
+    if not relevant_tickers:
+        st.info("No hay activos que aparezcan en multiples ejecuciones todavia.")
+        return
+
+    # Selector de tickers
+    default_show = relevant_tickers[:8]
+    selected_tickers = st.multiselect(
+        "Selecciona activos para ver su evolucion:",
+        options=relevant_tickers,
+        default=default_show,
+        key="dashboard_ticker_select",
+    )
+
+    if not selected_tickers:
+        st.info("Selecciona al menos un activo.")
+        return
+
+    # 1. Grafico de evolucion de puntaje
+    score_rows = []
+    for run_idx, df in enumerate(history, start=1):
+        if "Puntaje" not in df.columns or "Ticker" not in df.columns:
+            continue
+        for _, row in df.iterrows():
+            ticker = str(row["Ticker"]).upper()
+            if ticker in selected_tickers:
+                score_rows.append({
+                    "Ejecucion": f"#{run_idx}",
+                    "Run": run_idx,
+                    "Ticker": ticker,
+                    "Puntaje": int(row.get("Puntaje", 0)),
+                })
+
+    if score_rows:
+        score_evo_df = pd.DataFrame(score_rows)
+
+        st.markdown("#### Evolucion del puntaje por activo")
+        chart = alt.Chart(score_evo_df).mark_line(point=True, strokeWidth=2).encode(
+            x=alt.X("Run:O", title="Ejecucion", axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Puntaje:Q", title="Puntaje", scale=alt.Scale(domain=[0, 7])),
+            color=alt.Color("Ticker:N", legend=alt.Legend(title="Activo")),
+            tooltip=["Ticker:N", "Ejecucion:N", "Puntaje:Q"],
+        ).properties(height=400)
+
+        # Bandas de referencia
+        buy_band = alt.Chart(pd.DataFrame({"y": [6]})).mark_rule(
+            strokeDash=[4, 4], color="#22c55e", strokeWidth=1
+        ).encode(y="y:Q")
+        watch_band = alt.Chart(pd.DataFrame({"y": [4]})).mark_rule(
+            strokeDash=[4, 4], color="#eab308", strokeWidth=1
+        ).encode(y="y:Q")
+
+        st.altair_chart(chart + buy_band + watch_band, use_container_width=True)
+        st.caption("Linea verde: umbral COMPRAR (6+) | Linea amarilla: umbral VIGILAR (4+)")
+
+    # 2. Mapa de calor: decision por ejecucion
+    decision_rows = []
+    for run_idx, df in enumerate(history, start=1):
+        if "Decision sugerida" not in df.columns or "Ticker" not in df.columns:
+            continue
+        for _, row in df.iterrows():
+            ticker = str(row["Ticker"]).upper()
+            if ticker in selected_tickers:
+                decision = str(row.get("Decision sugerida", "")).upper()
+                decision_rows.append({
+                    "Ejecucion": f"#{run_idx}",
+                    "Ticker": ticker,
+                    "Decision": decision,
+                    "Valor": _DECISION_RANK.get(decision, 0),
+                })
+
+    if decision_rows:
+        dec_evo_df = pd.DataFrame(decision_rows)
+
+        st.markdown("#### Mapa de decisiones por ejecucion")
+        heat = alt.Chart(dec_evo_df).mark_rect(cornerRadius=3).encode(
+            x=alt.X("Ejecucion:N", title="Ejecucion"),
+            y=alt.Y("Ticker:N", title=None, sort=selected_tickers),
+            color=alt.Color("Valor:Q",
+                scale=alt.Scale(domain=[0, 1, 2, 3], range=["#e5e7eb", "#f87171", "#fbbf24", "#4ade80"]),
+                legend=None,
+            ),
+            tooltip=["Ticker:N", "Ejecucion:N", "Decision:N"],
+        ).properties(height=max(250, len(selected_tickers) * 28))
+
+        text = alt.Chart(dec_evo_df).mark_text(fontSize=10, fontWeight="bold").encode(
+            x="Ejecucion:N",
+            y=alt.Y("Ticker:N", sort=selected_tickers),
+            text="Decision:N",
+            color=alt.Color("Valor:Q",
+                scale=alt.Scale(domain=[0, 1, 2, 3], range=["#7f1d1d", "#7f1d1d", "#78350f", "#064e3b"]),
+                legend=None,
+            ),
+        )
+
+        st.altair_chart(heat + text, use_container_width=True)
+
+    # 3. Tabla resumen: frecuencia y estabilidad
+    st.markdown("#### Resumen de activos recurrentes")
+    today = datetime.now()
+    summary_rows = []
+    for ticker in selected_tickers:
+        first_seen: datetime | None = None
+        buy_count = 0
+        watch_count = 0
+        avoid_count = 0
+        scores = []
+        for ts_str, df in history_wd:
+            if "Ticker" not in df.columns:
+                continue
+            mask = df["Ticker"].astype(str).str.upper() == ticker
+            if mask.any():
+                if first_seen is None:
+                    try:
+                        first_seen = datetime.fromisoformat(ts_str)
+                    except (ValueError, TypeError):
+                        pass
+                row = df[mask].iloc[0]
+                decision = str(row.get("Decision sugerida", "")).upper()
+                if decision == "COMPRAR":
+                    buy_count += 1
+                elif decision == "VIGILAR":
+                    watch_count += 1
+                elif decision == "EVITAR":
+                    avoid_count += 1
+                if "Puntaje" in df.columns:
+                    scores.append(int(row.get("Puntaje", 0)))
+
+        dias = max(1, (today - first_seen).days) if first_seen else 0
+        avg_score = sum(scores) / len(scores) if scores else 0
+        trend = ""
+        if len(scores) >= 2:
+            if scores[-1] > scores[-2]:
+                trend = "Mejorando"
+            elif scores[-1] < scores[-2]:
+                trend = "Empeorando"
+            else:
+                trend = "Estable"
+
+        summary_rows.append({
+            "Ticker": ticker,
+            "Dias presente": f"{dias}d",
+            "COMPRAR": buy_count,
+            "VIGILAR": watch_count,
+            "EVITAR": avoid_count,
+            "Score medio": f"{avg_score:.1f}",
+            "Tendencia": trend,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    def _color_trend(val: str) -> str:
+        v = str(val)
+        if v == "Mejorando":
+            return "background-color: #e8f7ea; color: #166534; font-weight: 600;"
+        if v == "Empeorando":
+            return "background-color: #fdeaea; color: #991b1b; font-weight: 600;"
+        if v == "Estable":
+            return "background-color: #f3f4f6; color: #374151;"
+        return ""
+
+    styled = summary_df.style.map(_color_trend, subset=["Tendencia"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -825,6 +1561,344 @@ def render_correlation(top10_df: pd.DataFrame) -> None:
         st.warning(f"**Alerta de correlacion alta (>0.8):** {len(high_corr)} pares detectados")
         for a, b, v in high_corr[:10]:
             st.caption(f"  {a} - {b}: {v:.2f}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5b. GRAFICOS DE VELAS (Candlestick)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner="Descargando datos OHLCV...")
+def _fetch_ohlcv(ticker: str, months: int = 60) -> pd.DataFrame | None:
+    """Descarga datos OHLCV semanales de un ticker (5 anos por defecto)."""
+    from datetime import timedelta
+    end = datetime.now()
+    start = end - timedelta(days=months * 30)
+    try:
+        data = yf.download(
+            ticker, start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"), interval="1wk", progress=False,
+        )
+        if data.empty or len(data) < 5:
+            return None
+        df = data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        df.columns = ["Open", "High", "Low", "Close", "Volume"]
+        return df
+    except Exception:
+        return None
+
+
+def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Calcula el RSI (Relative Strength Index)."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _compute_stoch_rsi(series: pd.Series, rsi_period: int = 14, stoch_period: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> tuple[pd.Series, pd.Series]:
+    """Calcula el Stochastic RSI (%K y %D)."""
+    rsi = _compute_rsi(series, rsi_period)
+    rsi_min = rsi.rolling(stoch_period).min()
+    rsi_max = rsi.rolling(stoch_period).max()
+    stoch_rsi = (rsi - rsi_min) / (rsi_max - rsi_min) * 100
+    k = stoch_rsi.rolling(k_smooth).mean()
+    d = k.rolling(d_smooth).mean()
+    return k, d
+
+
+def _add_elliott_overlay(fig: go.Figure, df: pd.DataFrame) -> dict:
+    """Anade el zigzag de Elliott Wave al grafico de velas y devuelve info de onda."""
+    closes = df["Close"].tolist()
+    if len(closes) < 60:
+        return {}
+
+    ew = classify_elliott_wave(closes)
+    pivots = find_zigzag_pivots(closes[-252:] if len(closes) >= 252 else closes, pct_threshold=5.0)
+    if not pivots:
+        return ew
+
+    # Mapear indices de pivots a fechas del DataFrame
+    offset = max(0, len(closes) - 252)
+    pivot_dates = []
+    pivot_prices = []
+    for idx, price, ptype in pivots:
+        real_idx = idx + offset
+        if real_idx < len(df):
+            pivot_dates.append(df.index[real_idx])
+            pivot_prices.append(price)
+
+    if len(pivot_dates) >= 2:
+        # Linea zigzag
+        fig.add_trace(go.Scatter(
+            x=pivot_dates, y=pivot_prices,
+            mode="lines", name="Elliott Zigzag",
+            line=dict(color="#ffd600", width=2, dash="dot"),
+            opacity=0.8,
+        ))
+
+    # Marcadores en cada pivot con etiqueta H/L
+    _WAVE_COLORS = {"H": "#4ade80", "L": "#f87171"}
+    for i, (idx, price, ptype) in enumerate(pivots):
+        real_idx = idx + offset
+        if real_idx >= len(df):
+            continue
+        date = df.index[real_idx]
+        fig.add_trace(go.Scatter(
+            x=[date], y=[price],
+            mode="markers+text",
+            marker=dict(size=9, color=_WAVE_COLORS.get(ptype, "#fff"), symbol="diamond"),
+            text=[ptype],
+            textposition="top center" if ptype == "H" else "bottom center",
+            textfont=dict(size=10, color=_WAVE_COLORS.get(ptype, "#fff")),
+            showlegend=False,
+            hovertext=f"{ptype} {price:.2f}",
+            hoverinfo="text",
+        ))
+
+    # Lineas horizontales de targets
+    last_date = df.index[-1]
+    if ew.get("target_1m", 0) > 0:
+        for label, key, color, dash in [
+            ("Target 1m", "target_1m", "#42a5f5", "dash"),
+            ("Target 3m", "target_3m", "#ff9800", "dash"),
+            ("Target 6m", "target_6m", "#ab47bc", "dashdot"),
+        ]:
+            val = ew[key]
+            fig.add_hline(
+                y=val, line_dash=dash, line_color=color, line_width=0.8,
+                annotation_text=f"{label}: ${val:.2f}",
+                annotation_position="top right",
+                annotation_font_color=color,
+                annotation_font_size=10,
+            )
+
+    return ew
+
+
+def _build_candlestick_figure(df: pd.DataFrame, ticker: str) -> tuple[go.Figure, dict]:
+    """Construye un grafico de velas con medias moviles y overlay de Elliott Wave."""
+    fig = go.Figure()
+
+    # Velas
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"],
+        low=df["Low"], close=df["Close"],
+        name=ticker,
+        increasing_line_color="#26a69a",
+        decreasing_line_color="#ef5350",
+    ))
+
+    # SMA 20
+    if len(df) >= 20:
+        sma20 = df["Close"].rolling(20).mean()
+        fig.add_trace(go.Scatter(
+            x=df.index, y=sma20, mode="lines",
+            name="SMA 20", line=dict(color="#ff9800", width=1),
+        ))
+
+    # SMA 50
+    if len(df) >= 50:
+        sma50 = df["Close"].rolling(50).mean()
+        fig.add_trace(go.Scatter(
+            x=df.index, y=sma50, mode="lines",
+            name="SMA 50", line=dict(color="#2196f3", width=1),
+        ))
+
+    # SMA 200
+    if len(df) >= 200:
+        sma200 = df["Close"].rolling(200).mean()
+        fig.add_trace(go.Scatter(
+            x=df.index, y=sma200, mode="lines",
+            name="SMA 200", line=dict(color="#ab47bc", width=1, dash="dot"),
+        ))
+
+    # Overlay Elliott Wave
+    ew = _add_elliott_overlay(fig, df)
+
+    title_ew = ""
+    if ew.get("onda"):
+        title_ew = f" | Onda {ew['onda']} — {ew.get('fase', '')}"
+
+    fig.update_layout(
+        title=f"{_ticker_label(ticker)} — Semanal (5 anos){title_ew}",
+        yaxis_title="Precio",
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        height=500,
+        margin=dict(l=40, r=20, t=50, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig, ew
+
+
+def _build_volume_figure(df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Construye un grafico de barras de volumen."""
+    colors = [
+        "#26a69a" if c >= o else "#ef5350"
+        for c, o in zip(df["Close"], df["Open"])
+    ]
+    fig = go.Figure(go.Bar(
+        x=df.index, y=df["Volume"], marker_color=colors, name="Volumen",
+    ))
+    fig.update_layout(
+        yaxis_title="Volumen",
+        template="plotly_dark",
+        height=150,
+        margin=dict(l=40, r=20, t=10, b=20),
+        showlegend=False,
+    )
+    return fig
+
+
+def _build_rsi_figure(df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Construye un grafico de RSI(14) con zonas de sobrecompra/sobreventa."""
+    rsi = _compute_rsi(df["Close"], 14)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df.index, y=rsi, mode="lines",
+        name="RSI(14)", line=dict(color="#42a5f5", width=1.5),
+    ))
+
+    # Zonas de referencia
+    fig.add_hline(y=70, line_dash="dash", line_color="#ef5350", line_width=0.8,
+                  annotation_text="Sobrecompra (70)", annotation_position="top left")
+    fig.add_hline(y=30, line_dash="dash", line_color="#26a69a", line_width=0.8,
+                  annotation_text="Sobreventa (30)", annotation_position="bottom left")
+    fig.add_hrect(y0=70, y1=100, fillcolor="#ef5350", opacity=0.07, line_width=0)
+    fig.add_hrect(y0=0, y1=30, fillcolor="#26a69a", opacity=0.07, line_width=0)
+
+    fig.update_layout(
+        yaxis_title="RSI",
+        yaxis=dict(range=[0, 100]),
+        template="plotly_dark",
+        height=200,
+        margin=dict(l=40, r=20, t=10, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def _build_stoch_rsi_figure(df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Construye un grafico de Stochastic RSI (%K y %D)."""
+    k, d = _compute_stoch_rsi(df["Close"])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df.index, y=k, mode="lines",
+        name="%K", line=dict(color="#42a5f5", width=1.5),
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=d, mode="lines",
+        name="%D", line=dict(color="#ff9800", width=1.2, dash="dot"),
+    ))
+
+    # Zonas de referencia
+    fig.add_hline(y=80, line_dash="dash", line_color="#ef5350", line_width=0.8,
+                  annotation_text="80", annotation_position="top left")
+    fig.add_hline(y=20, line_dash="dash", line_color="#26a69a", line_width=0.8,
+                  annotation_text="20", annotation_position="bottom left")
+    fig.add_hrect(y0=80, y1=100, fillcolor="#ef5350", opacity=0.07, line_width=0)
+    fig.add_hrect(y0=0, y1=20, fillcolor="#26a69a", opacity=0.07, line_width=0)
+
+    fig.update_layout(
+        yaxis_title="Stoch RSI",
+        yaxis=dict(range=[0, 100]),
+        template="plotly_dark",
+        height=200,
+        margin=dict(l=40, r=20, t=10, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def render_candlestick(top10_df: pd.DataFrame, score_df: pd.DataFrame, pass_id: str = "p1") -> None:
+    """Renderiza graficos de velas para los activos del Top 20."""
+    if top10_df.empty:
+        return
+
+    tickers = top10_df["Ticker"].tolist()
+    if not tickers:
+        return
+
+    st.subheader("Graficos de velas — Semanal (5 anos) con Ondas de Elliott")
+
+    # Pre-seleccionar solo los COMPRAR si hay scoreboard
+    default_tickers = tickers[:5]
+    if not score_df.empty and "Decision sugerida" in score_df.columns:
+        buy_tickers = score_df[
+            score_df["Decision sugerida"].str.upper() == "COMPRAR"
+        ]["Ticker"].tolist()
+        if buy_tickers:
+            default_tickers = buy_tickers[:5]
+
+    selected = st.multiselect(
+        "Selecciona activos para ver velas:",
+        options=tickers,
+        default=[t for t in default_tickers if t in tickers],
+        key=f"candle_select_{pass_id}",
+        format_func=_ticker_label,
+    )
+
+    if not selected:
+        st.info("Selecciona al menos un activo para ver su grafico.")
+        return
+
+    for ticker in selected:
+        ohlcv = _fetch_ohlcv(ticker)
+        if ohlcv is None:
+            st.warning(f"No se pudieron obtener datos para {ticker}.")
+            continue
+
+        st.markdown(f"#### {_ticker_label(ticker)}")
+
+        candle_fig, ew = _build_candlestick_figure(ohlcv, ticker)
+        st.plotly_chart(candle_fig, use_container_width=True, key=f"candle_{pass_id}_{ticker}")
+
+        # Info Elliott Wave
+        if ew.get("onda") and ew["onda"] != "N/D":
+            _favorable = {"1↑", "2↓", "3↑", "4↓", "C↓"}
+            _color = "#4ade80" if ew["onda"] in _favorable else "#f87171"
+            e1, e2, e3, e4 = st.columns(4)
+            e1.markdown(f"**Onda:** <span style='color:{_color};font-size:1.3em;font-weight:700'>{ew['onda']}</span> — {ew.get('fase', '')}", unsafe_allow_html=True)
+            e2.metric("Target 1m", f"${ew['target_1m']:.2f}", f"{ew['rent_1m']:+.1f}%")
+            e3.metric("Target 3m", f"${ew['target_3m']:.2f}", f"{ew['rent_3m']:+.1f}%")
+            e4.metric("Target 6m", f"${ew['target_6m']:.2f}", f"{ew['rent_6m']:+.1f}%")
+            st.caption(f"📊 {ew.get('prevision', '')}")
+
+        volume_fig = _build_volume_figure(ohlcv, ticker)
+        st.plotly_chart(volume_fig, use_container_width=True, key=f"vol_{pass_id}_{ticker}")
+
+        rsi_fig = _build_rsi_figure(ohlcv, ticker)
+        st.plotly_chart(rsi_fig, use_container_width=True, key=f"rsi_{pass_id}_{ticker}")
+
+        stoch_fig = _build_stoch_rsi_figure(ohlcv, ticker)
+        st.plotly_chart(stoch_fig, use_container_width=True, key=f"stochrsi_{pass_id}_{ticker}")
+
+        # Metricas rapidas
+        last_close = ohlcv["Close"].iloc[-1]
+        prev_close = ohlcv["Close"].iloc[-2] if len(ohlcv) >= 2 else last_close
+        first_close = ohlcv["Close"].iloc[0]
+        change_1d = ((last_close - prev_close) / prev_close) * 100
+        change_period = ((last_close - first_close) / first_close) * 100
+        high_period = ohlcv["High"].max()
+        low_period = ohlcv["Low"].min()
+
+        rsi_val = _compute_rsi(ohlcv["Close"], 14).iloc[-1]
+        k_val, _d_val = _compute_stoch_rsi(ohlcv["Close"])
+        stoch_val = k_val.iloc[-1]
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Cierre", f"${last_close:.2f}", f"{change_1d:+.2f}%")
+        c2.metric("Cambio 5a", f"{change_period:+.1f}%")
+        c3.metric("Maximo", f"${high_period:.2f}")
+        c4.metric("Minimo", f"${low_period:.2f}")
+        c5.metric("RSI(14)", f"{rsi_val:.1f}")
+        c6.metric("Stoch RSI", f"{stoch_val:.1f}")
+        st.divider()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1070,7 +2144,7 @@ def render_results(full_output: str) -> None:
             pass2_output = full_output[idx2:idx3]
             pass3_output = full_output[idx3:]
 
-            t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs([
                 "Resumen Pasada 1",
                 "Tablas Pasada 1",
                 "Resumen Pasada 2 (sin EVITAR)",
@@ -1078,56 +2152,72 @@ def render_results(full_output: str) -> None:
                 "Resumen Pasada 3 (filtrado final)",
                 "Tablas Pasada 3",
                 "Flujo entre pasadas",
+                "Alertas de precio",
+                "Dashboard",
                 "Historico",
             ])
 
             with t1:
-                _render_pass_summary(pass1_output)
+                _render_pass_summary(pass1_output, pass_id="p1")
             with t2:
                 _render_pass_tables(pass1_output)
             with t3:
-                _render_pass_summary(pass2_output)
+                _render_pass_summary(pass2_output, pass_id="p2")
             with t4:
                 _render_pass_tables(pass2_output)
             with t5:
-                _render_pass_summary(pass3_output)
+                _render_pass_summary(pass3_output, pass_id="p3")
             with t6:
                 _render_pass_tables(pass3_output)
             with t7:
                 render_funnel(full_output)
             with t8:
+                render_price_alerts()
+            with t9:
+                render_dashboard()
+            with t10:
                 render_history_tab()
         else:
             pass2_output = full_output[idx2:]
 
-            t1, t2, t3, t4, t5, t6 = st.tabs([
+            t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
                 "Resumen Pasada 1",
                 "Tablas Pasada 1",
                 "Resumen Pasada 2 (sin EVITAR)",
                 "Tablas Pasada 2",
                 "Flujo entre pasadas",
+                "Alertas de precio",
+                "Dashboard",
                 "Historico",
             ])
 
             with t1:
-                _render_pass_summary(pass1_output)
+                _render_pass_summary(pass1_output, pass_id="p1")
             with t2:
                 _render_pass_tables(pass1_output)
             with t3:
-                _render_pass_summary(pass2_output)
+                _render_pass_summary(pass2_output, pass_id="p2")
             with t4:
                 _render_pass_tables(pass2_output)
             with t5:
                 render_funnel(full_output)
             with t6:
+                render_price_alerts()
+            with t7:
+                render_dashboard()
+            with t8:
                 render_history_tab()
     else:
-        t1, t2, t3 = st.tabs(["Resumen", "Tablas de evaluacion", "Historico"])
+        t1, t2, t3, t4, t5 = st.tabs(["Resumen", "Tablas de evaluacion", "Alertas de precio", "Dashboard", "Historico"])
         with t1:
             _render_pass_summary(full_output)
         with t2:
             _render_pass_tables(full_output)
         with t3:
+            render_price_alerts()
+        with t4:
+            render_dashboard()
+        with t5:
             render_history_tab()
 
 
@@ -1150,51 +2240,136 @@ def main() -> None:
         st.error(f"No se encontro el script: {SCRIPT_PATH}")
         return
 
-    run_clicked = st.button("Iniciar debate", type="primary", use_container_width=True)
+    tab_debate, tab_portfolio = st.tabs(["Debate Macro", "Mi Cartera"])
 
-    if run_clicked:
-        cmd = build_command(
-            model=model.strip(),
-            host=host.strip(),
-            seconds=int(seconds),
-            max_turns=int(max_turns),
-            context_lines=int(context_lines),
-        )
-        code, full_output = stream_process(cmd)
+    # ── TAB 1: Debate Macro (flujo original) ──
+    with tab_debate:
+        run_clicked = st.button("Iniciar debate", type="primary", use_container_width=True, key="btn_debate")
 
-        st.divider()
-        st.subheader("Resultado")
-        if code == 0:
-            st.success("Ejecucion completada.")
-        else:
-            st.error("La ejecucion termino con errores. Revisa la salida completa.")
+        if run_clicked:
+            cmd = build_command(
+                model=model.strip(),
+                host=host.strip(),
+                seconds=int(seconds),
+                max_turns=int(max_turns),
+                context_lines=int(context_lines),
+            )
+            code, full_output = stream_process(cmd)
 
-        consensus = extract_consensus(full_output)
-        if consensus:
-            st.info(f"**Conclusion macroeconomica de los agentes:**\n\n{consensus}")
-
-        # Guardar en historico (siempre la ultima pasada disponible)
-        if code == 0:
-            if _PASS3_MARKER in full_output:
-                last_pass = full_output[full_output.index(_PASS3_MARKER):]
-            elif _PASS2_MARKER in full_output:
-                last_pass = full_output[full_output.index(_PASS2_MARKER):]
+            st.divider()
+            st.subheader("Resultado")
+            if code == 0:
+                st.success("Ejecucion completada.")
             else:
-                last_pass = full_output
-            tables = extract_named_tables(last_pass)
-            top10_df = extract_top10_table(last_pass)
-            score_df = build_scoreboard(top10_df, tables)
-            _save_run(model.strip(), score_df, full_output)
+                st.error("La ejecucion termino con errores. Revisa la salida completa.")
 
-        render_results(full_output)
+            consensus = extract_consensus(full_output)
+            if consensus:
+                st.info(f"**Conclusion macroeconomica de los agentes:**\n\n{consensus}")
 
-        st.download_button(
-            label="Descargar log completo",
-            data=full_output.encode("utf-8"),
-            file_name="debate_macro_output.txt",
-            mime="text/plain",
-            use_container_width=True,
+            render_timer(full_output)
+
+            # Guardar en historico (siempre la ultima pasada disponible)
+            if code == 0:
+                if _PASS3_MARKER in full_output:
+                    last_pass = full_output[full_output.index(_PASS3_MARKER):]
+                elif _PASS2_MARKER in full_output:
+                    last_pass = full_output[full_output.index(_PASS2_MARKER):]
+                else:
+                    last_pass = full_output
+                tables = extract_named_tables(last_pass)
+                top10_df = extract_top10_table(last_pass)
+                score_df = build_scoreboard(top10_df, tables)
+                _save_run(model.strip(), score_df, full_output)
+
+            render_results(full_output)
+
+            st.download_button(
+                label="Descargar log completo",
+                data=full_output.encode("utf-8"),
+                file_name="debate_macro_output.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    # ── TAB 2: Mi Cartera ──
+    with tab_portfolio:
+        st.subheader("Analiza tu cartera personal")
+        st.markdown(
+            "Introduce los tickers de los activos que tienes en cartera. "
+            "El sistema ejecutara un **debate focalizado** entre los 7 gestores sobre tus activos, "
+            "seguido de las **8 evaluaciones independientes** y el **veredicto final**."
         )
+        portfolio_input = st.text_area(
+            "Tickers (separados por comas)",
+            placeholder="Ej: AAPL, MSFT, TSLA, NVDA, IBE.MC, ITX.MC",
+            height=80,
+            key="portfolio_tickers_input",
+        )
+
+        portfolio_run = st.button("Analizar Mi Cartera", type="primary", use_container_width=True, key="btn_portfolio")
+
+        if portfolio_run:
+            raw_tickers = portfolio_input.strip()
+            if not raw_tickers:
+                st.warning("Introduce al menos un ticker para analizar.")
+            else:
+                # Limpiar y validar
+                tickers_clean = ",".join(t.strip().upper() for t in raw_tickers.replace(";", ",").split(",") if t.strip())
+                ticker_list = [t for t in tickers_clean.split(",") if t]
+                st.info(f"Analizando **{len(ticker_list)}** activos: {', '.join(ticker_list)}")
+
+                cmd = build_command(
+                    model=model.strip(),
+                    host=host.strip(),
+                    seconds=int(seconds),
+                    max_turns=int(max_turns),
+                    context_lines=int(context_lines),
+                    portfolio=tickers_clean,
+                )
+                code, full_output = stream_process(cmd)
+
+                st.divider()
+                st.subheader("Resultado - Mi Cartera")
+                if code == 0:
+                    st.success("Analisis completado.")
+                else:
+                    st.error("El analisis termino con errores. Revisa la salida completa.")
+
+                consensus = extract_consensus(full_output)
+                if consensus:
+                    st.info(f"**Conclusion de los agentes sobre tu cartera:**\n\n{consensus}")
+
+                render_timer(full_output)
+
+                # Guardar en historico
+                if code == 0:
+                    tables = extract_named_tables(full_output)
+                    top10_df = extract_top10_table(full_output)
+                    score_df = build_scoreboard(top10_df, tables)
+                    _save_run(f"{model.strip()} [Cartera]", score_df, full_output)
+
+                # Renderizar resultados (1 sola pasada, sin buscar P2/P3)
+                _render_portfolio_results(full_output)
+
+                st.download_button(
+                    label="Descargar log Mi Cartera",
+                    data=full_output.encode("utf-8"),
+                    file_name="mi_cartera_output.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+
+def _render_portfolio_results(full_output: str) -> None:
+    """Renderiza resultados de Mi Cartera: resumen + tablas en una sola pasada."""
+    if not full_output.strip():
+        return
+    tab_resumen, tab_tablas = st.tabs(["Resumen", "Tablas de evaluacion"])
+    with tab_resumen:
+        _render_pass_summary(full_output, pass_id="cartera")
+    with tab_tablas:
+        _render_pass_tables(full_output)
 
 
 if __name__ == "__main__":

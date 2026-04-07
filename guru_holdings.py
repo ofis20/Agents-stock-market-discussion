@@ -22,6 +22,7 @@ import pickle
 import re
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -235,10 +236,13 @@ def fetch_guru_holdings(guru_name: str) -> list[dict[str, Any]]:
 
 
 def fetch_all_guru_holdings() -> dict[str, list[dict[str, Any]]]:
-    """Descarga holdings de todos los gurús disponibles."""
+    """Descarga holdings de todos los gurús disponibles (en paralelo)."""
     result: dict[str, list[dict[str, Any]]] = {}
-    for guru_name in GURU_FUNDS:
-        result[guru_name] = fetch_guru_holdings(guru_name)
+    with ThreadPoolExecutor(max_workers=len(GURU_FUNDS)) as pool:
+        futures = {pool.submit(fetch_guru_holdings, name): name for name in GURU_FUNDS}
+        for future in futures:
+            name = futures[future]
+            result[name] = future.result()
     return result
 
 

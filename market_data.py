@@ -13,6 +13,7 @@ Universo: ~660 activos (500+ acciones, 100 ETFs, 20 commodities, 10 cripto, etc.
 
 from __future__ import annotations
 
+import gc
 import json as _json
 import os
 import pickle
@@ -24,6 +25,9 @@ from typing import Any
 
 import yfinance as yf
 import pandas as pd
+
+# Workers dinamicos: usa 2× nucleos logicos (IO-bound), minimo 8
+_DEFAULT_WORKERS = max(8, (os.cpu_count() or 4) * 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -61,6 +65,22 @@ def _cache_set(key: str, value: Any) -> None:
         pass
 
 
+def _cache_cleanup(max_age_seconds: int = 86_400 * 3) -> int:
+    """Elimina archivos de cache con mas de max_age_seconds de antiguedad."""
+    if not _CACHE_DIR.exists():
+        return 0
+    now = datetime.now().timestamp()
+    removed = 0
+    for p in _CACHE_DIR.glob("*.pkl"):
+        try:
+            if now - p.stat().st_mtime > max_age_seconds:
+                p.unlink()
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # UNIVERSO DE ACTIVOS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -69,14 +89,28 @@ def _build(tipo: str, tickers: dict[str, str]) -> dict[str, dict[str, str]]:
     return {t: {"nombre": n, "tipo": tipo} for t, n in tickers.items()}
 
 
-# ── INDICES GLOBALES (~16) ──
+# ── INDICES GLOBALES (~30) ──
 _INDICES: dict[str, str] = {
+    # Americas
     "^GSPC": "S&P 500", "^IXIC": "NASDAQ Composite", "^DJI": "Dow Jones",
-    "^RUT": "Russell 2000", "^STOXX50E": "Euro Stoxx 50", "^GDAXI": "DAX",
-    "^FTSE": "FTSE 100", "^FCHI": "CAC 40", "^N225": "Nikkei 225",
-    "^HSI": "Hang Seng", "000001.SS": "Shanghai Composite",
-    "^BVSP": "Bovespa", "^IBEX": "IBEX 35", "^KS11": "KOSPI",
-    "^TWII": "TAIEX", "^NSEI": "Nifty 50",
+    "^RUT": "Russell 2000", "^BVSP": "Bovespa", "^MXX": "IPC Mexico",
+    "^MERV": "MERVAL Argentina", "^IPSA": "IPSA Chile",
+    # Europa
+    "^STOXX50E": "Euro Stoxx 50", "^GDAXI": "DAX", "^FTSE": "FTSE 100",
+    "^FCHI": "CAC 40", "^IBEX": "IBEX 35", "FTSEMIB.MI": "FTSE MIB",
+    "^AEX": "AEX Amsterdam", "^SSMI": "SMI Suiza", "^OMX": "OMX Stockholm 30",
+    "^OMXC25": "OMX Copenhagen 25", "^OMXH25": "OMX Helsinki 25",
+    "^OSEAX": "Oslo All-Share", "WIG20.WA": "WIG 20 Polonia",
+    "XU100.IS": "BIST 100 Turquia", "^ATG": "Atenas General",
+    "^PSI20": "PSI 20 Portugal",
+    # Asia-Pacifico
+    "^N225": "Nikkei 225", "^HSI": "Hang Seng", "000001.SS": "Shanghai Composite",
+    "^KS11": "KOSPI", "^TWII": "TAIEX", "^NSEI": "Nifty 50",
+    "^STI": "STI Singapur", "^JKSE": "Jakarta Composite",
+    "^SET.BK": "SET Tailandia", "^KLSE": "KLCI Malasia",
+    "^AXJO": "ASX 200 Australia", "^TASI.SR": "Tadawul Arabia Saudi",
+    # Africa
+    "^J203.JO": "JSE All-Share Sudafrica",
 }
 
 # ── USA: Tecnologia (~60) ──
@@ -290,13 +324,28 @@ _INTL_ADR: dict[str, str] = {
 
 # ── Internacional: Bolsas europeas locales (~55) ──
 _EU_LOCAL: dict[str, str] = {
-    # UK (London)
+    # UK – FTSE 100 principales (London)
     "HSBA.L": "HSBC (London)", "LLOY.L": "Lloyds (London)", "BARC.L": "Barclays (London)",
     "GLEN.L": "Glencore (London)", "AAL.L": "Anglo American (London)",
     "DGE.L": "Diageo (London)", "REL.L": "RELX (London)", "LSEG.L": "LSEG (London)",
     "CPG.L": "Compass Group (London)", "ABF.L": "AB Foods (London)",
     "ANTO.L": "Antofagasta (London)", "RKT.L": "Reckitt (London)",
-    # Alemania (Frankfurt)
+    "AZN.L": "AstraZeneca (London)", "SHEL.L": "Shell (London)",
+    "ULVR.L": "Unilever (London)", "GSK.L": "GSK (London)",
+    "RIO.L": "Rio Tinto (London)", "NG.L": "National Grid (London)",
+    "BATS.L": "BAT (London)", "PRU.L": "Prudential (London)",
+    "SSE.L": "SSE (London)", "VOD.L": "Vodafone (London)",
+    "TSCO.L": "Tesco (London)", "BA.L": "BAE Systems (London)",
+    "SN.L": "Smith & Nephew (London)", "WPP.L": "WPP (London)",
+    "RR.L": "Rolls-Royce (London)", "III.L": "3i Group (London)",
+    "EXPN.L": "Experian (London)", "AHT.L": "Ashtead Group (London)",
+    "SBRY.L": "Sainsbury's (London)", "LAND.L": "British Land (London)",
+    "SGE.L": "Sage Group (London)", "SMDS.L": "DS Smith (London)",
+    "MNDI.L": "Mondi (London)", "NWG.L": "NatWest Group (London)",
+    "IMB.L": "Imperial Brands (London)", "IHG.L": "IHG Hotels (London)",
+    "BNZL.L": "Bunzl (London)", "CRH.L": "CRH (London)",
+    "STAN.L": "Standard Chartered (London)",
+    # Alemania – DAX 40 (Frankfurt)
     "SIE.DE": "Siemens (Frankfurt)", "ALV.DE": "Allianz (Frankfurt)",
     "MBG.DE": "Mercedes-Benz (Frankfurt)", "BMW.DE": "BMW (Frankfurt)",
     "DTE.DE": "Deutsche Telekom (Frankfurt)", "MUV2.DE": "Munich Re (Frankfurt)",
@@ -304,57 +353,324 @@ _EU_LOCAL: dict[str, str] = {
     "BEI.DE": "Beiersdorf (Frankfurt)", "HEN3.DE": "Henkel (Frankfurt)",
     "FRE.DE": "Fresenius (Frankfurt)", "DB1.DE": "Deutsche Boerse (Frankfurt)",
     "VOW3.DE": "Volkswagen (Frankfurt)", "BAS.DE": "BASF (Frankfurt)",
-    "DTG.DE": "Daimler Truck (Frankfurt)",
-    # Francia (Paris)
+    "DTG.DE": "Daimler Truck (Frankfurt)", "DBK.DE": "Deutsche Bank (Frankfurt)",
+    "RWE.DE": "RWE (Frankfurt)", "HEI.DE": "HeidelbergCement (Frankfurt)",
+    "SHL.DE": "Siemens Healthineers (Frankfurt)", "MTX.DE": "MTU Aero (Frankfurt)",
+    "SY1.DE": "Symrise (Frankfurt)", "PAH3.DE": "Porsche SE (Frankfurt)",
+    "P911.DE": "Porsche AG (Frankfurt)", "ZAL.DE": "Zalando (Frankfurt)",
+    "ENR.DE": "Siemens Energy (Frankfurt)", "1COV.DE": "Covestro (Frankfurt)",
+    "QIA.DE": "Qiagen (Frankfurt)", "AIR.DE": "Airbus (Frankfurt)",
+    "HNR1.DE": "Hannover Re (Frankfurt)", "CON.DE": "Continental (Frankfurt)",
+    "MRK.DE": "Merck KGaA (Frankfurt)", "EOAN.DE": "E.ON (Frankfurt)",
+    "SRT3.DE": "Sartorius (Frankfurt)", "PUM.DE": "Puma (Frankfurt)",
+    # Francia – CAC 40 (Paris)
     "MC.PA": "LVMH (Paris)", "OR.PA": "L'Oreal (Paris)", "AI.PA": "Air Liquide (Paris)",
     "SAN.PA": "Sanofi (Paris)", "BNP.PA": "BNP Paribas (Paris)",
     "CS.PA": "AXA (Paris)", "SU.PA": "Schneider Electric (Paris)",
     "AIR.PA": "Airbus (Paris)", "DG.PA": "Vinci (Paris)", "RI.PA": "Pernod Ricard (Paris)",
-    "KER.PA": "Kering (Paris)",
-    # Espana (Madrid)
+    "KER.PA": "Kering (Paris)", "SAF.PA": "Safran (Paris)",
+    "STM.PA": "STMicro (Paris)", "GLE.PA": "Societe Generale (Paris)",
+    "CAP.PA": "Capgemini (Paris)", "VIV.PA": "Vivendi (Paris)",
+    "SGO.PA": "Saint-Gobain (Paris)", "CA.PA": "Carrefour (Paris)",
+    "HO.PA": "Thales (Paris)", "ML.PA": "Michelin (Paris)",
+    "EN.PA": "Bouygues (Paris)", "TEP.PA": "Teleperformance (Paris)",
+    "ORA.PA": "Orange (Paris)", "ERA.PA": "Eramet (Paris)",
+    "DSY.PA": "Dassault Systemes (Paris)", "RNO.PA": "Renault (Paris)",
+    "LR.PA": "Legrand (Paris)", "WLN.PA": "Worldline (Paris)",
+    "EL.PA": "EssilorLuxottica (Paris)", "ATO.PA": "Atos (Paris)",
+    "BN.PA": "Danone (Paris)", "URW.PA": "Unibail-Rodamco (Paris)",
+    "PUB.PA": "Publicis (Paris)", "ENGI.PA": "Engie (Paris)",
+    # Espana – IBEX 35 completo (Madrid)
     "SAN.MC": "Banco Santander (Madrid)", "TEF.MC": "Telefonica (Madrid)",
     "IBE.MC": "Iberdrola (Madrid)", "ITX.MC": "Inditex (Madrid)",
     "REP.MC": "Repsol (Madrid)", "BBVA.MC": "BBVA (Madrid)",
     "FER.MC": "Ferrovial (Madrid)", "AMS.MC": "Amadeus IT (Madrid)",
-    "CABK.MC": "CaixaBank (Madrid)",
-    # Italia (Milan)
+    "CABK.MC": "CaixaBank (Madrid)", "ACS.MC": "ACS (Madrid)",
+    "AENA.MC": "Aena (Madrid)", "ANA.MC": "Acciona (Madrid)",
+    "ANE.MC": "Acciona Energia (Madrid)", "ACX.MC": "Acerinox (Madrid)",
+    "BKT.MC": "Bankinter (Madrid)", "CLNX.MC": "Cellnex (Madrid)",
+    "COL.MC": "Inmobiliaria Colonial (Madrid)", "ELE.MC": "Endesa (Madrid)",
+    "ENG.MC": "Enagas (Madrid)", "FDR.MC": "Fluidra (Madrid)",
+    "GRF.MC": "Grifols (Madrid)", "IAG.MC": "IAG (Madrid)",
+    "IDR.MC": "Indra (Madrid)", "LOG.MC": "Logista (Madrid)",
+    "MAP.MC": "Mapfre (Madrid)", "MEL.MC": "Melia Hotels (Madrid)",
+    "MRL.MC": "Merlin Properties (Madrid)", "MTS.MC": "ArcelorMittal (Madrid)",
+    "NTGY.MC": "Naturgy (Madrid)", "PHM.MC": "Pharma Mar (Madrid)",
+    "RED.MC": "Redeia (Madrid)", "ROVI.MC": "Laboratorios Rovi (Madrid)",
+    "SAB.MC": "Banco Sabadell (Madrid)", "SCYR.MC": "Sacyr (Madrid)",
+    "SLR.MC": "Solaria (Madrid)", "UNI.MC": "Unicaja (Madrid)",
+    # Portugal – PSI 20 (Lisboa)
+    "EDP.LS": "EDP (Lisboa)", "GALP.LS": "Galp Energia (Lisboa)",
+    "SON.LS": "Sonae (Lisboa)", "JMT.LS": "Jeronimo Martins (Lisboa)",
+    "EDPR.LS": "EDP Renovaveis (Lisboa)", "BCP.LS": "Banco Comercial Portugues (Lisboa)",
+    "NOS.LS": "NOS SGPS (Lisboa)", "ALTR.LS": "Altri (Lisboa)",
+    "CTT.LS": "CTT Correios (Lisboa)", "SEM.LS": "Semapa (Lisboa)",
+    # Italia – FTSE MIB (Milan)
     "ENEL.MI": "Enel (Milan)", "UCG.MI": "UniCredit (Milan)",
     "ISP.MI": "Intesa Sanpaolo (Milan)", "ENI.MI": "Eni (Milan)",
-    "STM": "STMicroelectronics (ADR)",
+    "STM": "STMicroelectronics (ADR)", "RACE.MI": "Ferrari (Milan)",
+    "G.MI": "Generali (Milan)", "TIT.MI": "Telecom Italia (Milan)",
+    "PIRC.MI": "Pirelli (Milan)", "BAMI.MI": "Banco BPM (Milan)",
+    "PRY.MI": "Prysmian (Milan)", "STLAM.MI": "Stellantis (Milan)",
+    "TEN.MI": "Tenaris (Milan)", "A2A.MI": "A2A (Milan)",
+    "CPR.MI": "Campari (Milan)", "MONC.MI": "Moncler (Milan)",
+    "SPM.MI": "Saipem (Milan)", "SRG.MI": "Snam (Milan)",
+    "TRN.MI": "Terna (Milan)", "AMP.MI": "Amplifon (Milan)",
+    "PST.MI": "Poste Italiane (Milan)", "MB.MI": "Mediobanca (Milan)",
+    "LDO.MI": "Leonardo (Milan)", "HER.MI": "Hera (Milan)",
+    "BGN.MI": "Brembo (Milan)", "REC.MI": "Recordati (Milan)",
+    "NWL.MI": "Newlat Food (Milan)",
+    # Paises Bajos (Amsterdam)
+    "PHIA.AS": "Philips (Amsterdam)", "AD.AS": "Ahold Delhaize (Amsterdam)",
+    "WKL.AS": "Wolters Kluwer (Amsterdam)", "UNA.AS": "Unilever (Amsterdam)",
+    "HEIA.AS": "Heineken (Amsterdam)", "MT.AS": "ArcelorMittal (Amsterdam)",
+    "RAND.AS": "Randstad (Amsterdam)", "AKZA.AS": "AkzoNobel (Amsterdam)",
+    "INGA.AS": "ING Group (Amsterdam)", "ASM.AS": "ASM International (Amsterdam)",
+    "IMCD.AS": "IMCD (Amsterdam)", "PRX.AS": "Prosus (Amsterdam)",
+    "DSM.AS": "DSM-Firmenich (Amsterdam)", "NN.AS": "NN Group (Amsterdam)",
+    # Belgica (Bruselas)
+    "ABI.BR": "AB InBev (Bruselas)", "UCB.BR": "UCB (Bruselas)",
+    "KBC.BR": "KBC Group (Bruselas)", "SOLB.BR": "Solvay (Bruselas)",
+    "ACKB.BR": "Ackermans & van Haaren (Bruselas)", "GBLB.BR": "GBL (Bruselas)",
+    # Nordicos – Suecia (Estocolmo)
+    "VOLV-B.ST": "Volvo (Estocolmo)", "ATCO-A.ST": "Atlas Copco (Estocolmo)",
+    "SAND.ST": "Sandvik (Estocolmo)", "SEB-A.ST": "SEB (Estocolmo)",
+    "INVE-B.ST": "Investor AB (Estocolmo)", "HM-B.ST": "H&M (Estocolmo)",
+    "ABB.ST": "ABB (Estocolmo)", "HEXA-B.ST": "Hexagon (Estocolmo)",
+    "ALFA.ST": "Alfa Laval (Estocolmo)", "ASSA-B.ST": "Assa Abloy (Estocolmo)",
+    "ERIC-B.ST": "Ericsson (Estocolmo)", "TEL2-B.ST": "Tele2 (Estocolmo)",
+    "SCA-B.ST": "SCA (Estocolmo)", "SKF-B.ST": "SKF (Estocolmo)",
+    "ESSITY-B.ST": "Essity (Estocolmo)", "SWED-A.ST": "Swedbank (Estocolmo)",
+    "KINV-B.ST": "Kinnevik (Estocolmo)",
+    # Nordicos – Dinamarca (Copenhague)
+    "NOVO-B.CO": "Novo Nordisk (Copenhague)", "CARL-B.CO": "Carlsberg (Copenhague)",
+    "MAERSK-B.CO": "Maersk (Copenhague)", "VWS.CO": "Vestas Wind (Copenhague)",
+    "DSV.CO": "DSV (Copenhague)", "PNDORA.CO": "Pandora (Copenhague)",
+    "COLO-B.CO": "Coloplast (Copenhague)", "GN.CO": "GN Store Nord (Copenhague)",
+    "TRYG.CO": "Tryg (Copenhague)", "ORSTED.CO": "Orsted (Copenhague)",
+    "DEMANT.CO": "Demant (Copenhague)",
+    # Nordicos – Finlandia (Helsinki)
+    "NOKIA.HE": "Nokia (Helsinki)", "NESTE.HE": "Neste (Helsinki)",
+    "FORTUM.HE": "Fortum (Helsinki)", "SAMPO.HE": "Sampo (Helsinki)",
+    "KNEBV.HE": "Kone (Helsinki)", "UPM.HE": "UPM-Kymmene (Helsinki)",
+    "STERV.HE": "Stora Enso (Helsinki)", "WRT1V.HE": "Wartsila (Helsinki)",
+    # Nordicos – Noruega (Oslo)
+    "EQNR.OL": "Equinor (Oslo)", "DNB.OL": "DNB Bank (Oslo)",
+    "TEL.OL": "Telenor (Oslo)", "MOWI.OL": "Mowi (Oslo)",
+    "ORK.OL": "Orkla (Oslo)", "YAR.OL": "Yara International (Oslo)",
+    "SALM.OL": "SalMar (Oslo)", "KOG.OL": "Kongsberg Gruppen (Oslo)",
+    "AKER.OL": "Aker (Oslo)", "AKRBP.OL": "Aker BP (Oslo)",
+    "SUBC.OL": "Subsea 7 (Oslo)", "BWLPG.OL": "BW LPG (Oslo)",
     # Suiza
     "NESN.SW": "Nestle (Zurich)", "ROG.SW": "Roche (Zurich)",
     "NOVN.SW": "Novartis (Zurich)", "UBSG.SW": "UBS (Zurich)",
-    "ABBN.SW": "ABB (Zurich)",
+    "ABBN.SW": "ABB (Zurich)", "SREN.SW": "Swiss Re (Zurich)",
+    "ZURN.SW": "Zurich Insurance (Zurich)", "LONN.SW": "Lonza (Zurich)",
+    "GEBN.SW": "Geberit (Zurich)", "SGSN.SW": "SGS (Zurich)",
+    "GIVN.SW": "Givaudan (Zurich)", "SCMN.SW": "Swisscom (Zurich)",
+    "SLHN.SW": "Swiss Life (Zurich)", "SIKA.SW": "Sika (Zurich)",
+    # Polonia (Varsovia)
+    "PKN.WA": "PKN Orlen (Varsovia)", "PEO.WA": "Bank Pekao (Varsovia)",
+    "PKO.WA": "PKO BP (Varsovia)", "PZU.WA": "PZU (Varsovia)",
+    "KGH.WA": "KGHM (Varsovia)", "DNP.WA": "Dino Polska (Varsovia)",
+    "LPP.WA": "LPP (Varsovia)", "ALE.WA": "Allegro (Varsovia)",
+    "CDR.WA": "CD Projekt (Varsovia)", "SPR.WA": "Spyrosoft (Varsovia)",
+    # Turquia (Estambul)
+    "THYAO.IS": "Turkish Airlines (Estambul)", "GARAN.IS": "Garanti BBVA (Estambul)",
+    "EREGL.IS": "Eregli Demir (Estambul)", "AKBNK.IS": "Akbank (Estambul)",
+    "BIMAS.IS": "BIM (Estambul)", "SISE.IS": "Sisecam (Estambul)",
+    "KCHOL.IS": "Koc Holding (Estambul)", "TUPRS.IS": "Tupras (Estambul)",
+    # Grecia (Atenas)
+    "OPAP.AT": "OPAP (Atenas)", "ETE.AT": "National Bank Greece (Atenas)",
+    "EUROB.AT": "Eurobank (Atenas)", "HTO.AT": "Hellenic Telecom (Atenas)",
+    "MYTIL.AT": "Mytilineos (Atenas)",
 }
 
 # ── Internacional: Asia / Pacifico locales (~45) ──
 _ASIA_LOCAL: dict[str, str] = {
-    # Japon (Tokyo)
+    # Japon – Nikkei 225 principales (Tokyo)
     "7203.T": "Toyota (Tokyo)", "6758.T": "Sony (Tokyo)", "8306.T": "MUFG (Tokyo)",
     "9984.T": "SoftBank Group (Tokyo)", "6501.T": "Hitachi (Tokyo)",
     "7267.T": "Honda (Tokyo)", "4502.T": "Takeda Pharma (Tokyo)",
     "6902.T": "Denso (Tokyo)", "8035.T": "Tokyo Electron (Tokyo)",
     "6861.T": "Keyence (Tokyo)", "9432.T": "NTT (Tokyo)", "8001.T": "ITOCHU (Tokyo)",
     "4063.T": "Shin-Etsu Chemical (Tokyo)", "6098.T": "Recruit Holdings (Tokyo)",
-    "3382.T": "Seven & i (Tokyo)",
+    "3382.T": "Seven & i (Tokyo)", "6367.T": "Daikin (Tokyo)",
+    "4568.T": "Daiichi Sankyo (Tokyo)", "9983.T": "Fast Retailing (Tokyo)",
+    "6594.T": "Nidec (Tokyo)", "7741.T": "HOYA (Tokyo)",
+    "6857.T": "Advantest (Tokyo)", "8058.T": "Mitsubishi Corp (Tokyo)",
+    "8031.T": "Mitsui & Co (Tokyo)", "2914.T": "Japan Tobacco (Tokyo)",
+    "6273.T": "SMC Corp (Tokyo)", "4519.T": "Chugai Pharma (Tokyo)",
+    "7751.T": "Canon (Tokyo)", "6971.T": "Kyocera (Tokyo)",
+    "8316.T": "SMFG (Tokyo)", "6954.T": "Fanuc (Tokyo)",
+    "4661.T": "Oriental Land (Tokyo)", "8766.T": "Tokio Marine (Tokyo)",
     # Hong Kong
     "0700.HK": "Tencent (HK)", "9988.HK": "Alibaba (HK)", "3690.HK": "Meituan (HK)",
     "1810.HK": "Xiaomi (HK)", "2318.HK": "Ping An Insurance (HK)",
     "0005.HK": "HSBC (HK)", "1299.HK": "AIA Group (HK)", "2020.HK": "ANTA Sports (HK)",
     "0941.HK": "China Mobile (HK)", "1211.HK": "BYD (HK)",
-    # Corea (KSE)
+    "0388.HK": "HKEX (HK)", "0001.HK": "CK Hutchison (HK)",
+    "0016.HK": "Sun Hung Kai (HK)", "0002.HK": "CLP Holdings (HK)",
+    "0003.HK": "HK & China Gas (HK)", "2628.HK": "China Life (HK)",
+    "0027.HK": "Galaxy Entertainment (HK)", "1928.HK": "Sands China (HK)",
+    "9618.HK": "JD.com (HK)", "9999.HK": "NetEase (HK)",
+    # China Continental (Shanghai / Shenzhen)
+    "600519.SS": "Kweichow Moutai (Shanghai)", "601318.SS": "Ping An (Shanghai)",
+    "600036.SS": "China Merchants Bank (Shanghai)", "601888.SS": "China Tourism (Shanghai)",
+    "600276.SS": "Jiangsu Hengrui (Shanghai)", "601899.SS": "Zijin Mining (Shanghai)",
+    "000858.SZ": "Wuliangye (Shenzhen)", "300750.SZ": "CATL (Shenzhen)",
+    "002594.SZ": "BYD (Shenzhen)", "000333.SZ": "Midea Group (Shenzhen)",
+    "002415.SZ": "Hikvision (Shenzhen)", "000651.SZ": "Gree Electric (Shenzhen)",
+    # Corea del Sur (KSE)
     "005930.KS": "Samsung Electronics (Corea)", "000660.KS": "SK Hynix (Corea)",
     "035420.KS": "NAVER (Corea)", "051910.KS": "LG Chem (Corea)",
     "006400.KS": "Samsung SDI (Corea)", "035720.KS": "Kakao (Corea)",
+    "003670.KS": "POSCO Holdings (Corea)", "105560.KS": "KB Financial (Corea)",
+    "055550.KS": "Shinhan Financial (Corea)", "068270.KS": "Celltrion (Corea)",
+    "005380.KS": "Hyundai Motor (Corea)", "000270.KS": "Kia (Corea)",
+    "066570.KS": "LG Electronics (Corea)", "034730.KS": "SK Inc (Corea)",
+    "017670.KS": "SK Telecom (Corea)",
     # India (NSE)
     "RELIANCE.NS": "Reliance Industries (India)", "TCS.NS": "TCS (India)",
     "HDFCBANK.NS": "HDFC Bank (India)", "ICICIBANK.NS": "ICICI Bank (India)",
     "BHARTIARTL.NS": "Bharti Airtel (India)", "ITC.NS": "ITC Ltd (India)",
     "SBIN.NS": "SBI (India)", "BAJFINANCE.NS": "Bajaj Finance (India)",
-    # Australia (ASX)
+    "INFY.NS": "Infosys (India)", "LT.NS": "Larsen & Toubro (India)",
+    "HINDUNILVR.NS": "Hindustan Unilever (India)", "KOTAKBANK.NS": "Kotak Mahindra (India)",
+    "TATAMOTORS.NS": "Tata Motors (India)", "TATASTEEL.NS": "Tata Steel (India)",
+    "SUNPHARMA.NS": "Sun Pharma (India)", "M&M.NS": "Mahindra & Mahindra (India)",
+    "ASIANPAINT.NS": "Asian Paints (India)", "ADANIENT.NS": "Adani Enterprises (India)",
+    "ADANIPORTS.NS": "Adani Ports (India)", "WIPRO.NS": "Wipro (India)",
+    "POWERGRID.NS": "Power Grid India", "NTPC.NS": "NTPC (India)",
+    "JSWSTEEL.NS": "JSW Steel (India)", "TITAN.NS": "Titan Company (India)",
+    "ULTRACEMCO.NS": "UltraTech Cement (India)", "ONGC.NS": "ONGC (India)",
+    "COALINDIA.NS": "Coal India", "MARUTI.NS": "Maruti Suzuki (India)",
+    "HCLTECH.NS": "HCL Technologies (India)", "DRREDDY.NS": "Dr. Reddy's (India)",
+    # Taiwan (TWSE)
+    "2330.TW": "TSMC (Taiwan)", "2317.TW": "Hon Hai / Foxconn (Taiwan)",
+    "2454.TW": "MediaTek (Taiwan)", "2412.TW": "Chunghwa Telecom (Taiwan)",
+    "2881.TW": "Fubon Financial (Taiwan)", "2882.TW": "Cathay Financial (Taiwan)",
+    "1301.TW": "Formosa Plastics (Taiwan)", "2308.TW": "Delta Electronics (Taiwan)",
+    "3711.TW": "ASE Technology (Taiwan)", "2303.TW": "United Microelectronics (Taiwan)",
+    # Australia – ASX 50 principales (Sydney)
     "CSL.AX": "CSL Limited (Australia)", "CBA.AX": "Comm Bank Australia",
     "WES.AX": "Wesfarmers (Australia)", "MQG.AX": "Macquarie Group (Australia)",
     "NAB.AX": "NAB (Australia)", "WOW.AX": "Woolworths (Australia)",
+    "BHP.AX": "BHP Group (Australia)", "FMG.AX": "Fortescue Metals (Australia)",
+    "WBC.AX": "Westpac (Australia)", "ANZ.AX": "ANZ Banking (Australia)",
+    "RIO.AX": "Rio Tinto (Australia)", "WDS.AX": "Woodside Energy (Australia)",
+    "TLS.AX": "Telstra (Australia)", "ALL.AX": "Aristocrat Leisure (Australia)",
+    "GMG.AX": "Goodman Group (Australia)", "TCL.AX": "Transurban (Australia)",
+    "COL.AX": "Coles Group (Australia)", "SHL.AX": "Sonic Healthcare (Australia)",
+    "JHX.AX": "James Hardie (Australia)", "QBE.AX": "QBE Insurance (Australia)",
+    "STO.AX": "Santos (Australia)", "ORG.AX": "Origin Energy (Australia)",
+    "REA.AX": "REA Group (Australia)", "XRO.AX": "Xero (Australia)",
+    "MIN.AX": "Mineral Resources (Australia)", "APA.AX": "APA Group (Australia)",
+    "IAG.AX": "Insurance Aust Group", "AMC.AX": "Amcor (Australia)",
+    "S32.AX": "South32 (Australia)", "COH.AX": "Cochlear (Australia)",
+    "CPU.AX": "Computershare (Australia)", "TWE.AX": "Treasury Wine (Australia)",
+    "NCM.AX": "Newcrest Mining (Australia)", "MPL.AX": "Medibank (Australia)",
+    "ALD.AX": "Ampol (Australia)", "DXS.AX": "Dexus (Australia)",
+    "SGP.AX": "Stockland (Australia)", "ORI.AX": "Orica (Australia)",
+    "SUN.AX": "Suncorp (Australia)", "RMD.AX": "ResMed (Australia)",
+    "SCG.AX": "Scentre Group (Australia)", "MGR.AX": "Mirvac (Australia)",
+    "IEL.AX": "IDP Education (Australia)", "LYC.AX": "Lynas Rare Earths (Australia)",
+    "PLS.AX": "Pilbara Minerals (Australia)", "NHF.AX": "nib Holdings (Australia)",
+    "ALX.AX": "Atlas Arteria (Australia)", "LLC.AX": "Lendlease (Australia)",
+    "CAR.AX": "CAR Group (Australia)", "SEK.AX": "Seek (Australia)",
+    # Singapur
+    "D05.SI": "DBS Group (Singapur)", "O39.SI": "OCBC Bank (Singapur)",
+    "U11.SI": "UOB (Singapur)", "Z74.SI": "SingTel (Singapur)",
+    "C38U.SI": "CapitaLand Invest (Singapur)", "Y92.SI": "Thai Beverage (Singapur)",
+    "BN4.SI": "Keppel Corp (Singapur)",
+    # Indonesia (Jakarta)
+    "BBCA.JK": "Bank Central Asia (Indonesia)", "TLKM.JK": "Telkom Indonesia",
+    "BBRI.JK": "Bank Rakyat Indonesia", "BMRI.JK": "Bank Mandiri (Indonesia)",
+    "ASII.JK": "Astra International (Indonesia)", "UNVR.JK": "Unilever Indonesia",
+    "ICBP.JK": "Indofood CBP (Indonesia)",
+    # Tailandia
+    "PTT.BK": "PTT (Tailandia)", "AOT.BK": "Airports of Thailand",
+    "ADVANC.BK": "AIS (Tailandia)", "CPALL.BK": "CP All (Tailandia)",
+    "SCC.BK": "Siam Cement (Tailandia)", "BDMS.BK": "Bangkok Dusit Medical (Tailandia)",
+    # Malasia (Kuala Lumpur)
+    "1155.KL": "Maybank (Malasia)", "1295.KL": "Public Bank (Malasia)",
+    "6888.KL": "Petronas Chemicals (Malasia)", "3182.KL": "Genting (Malasia)",
+    "5225.KL": "IHH Healthcare (Malasia)", "4715.KL": "Genting Malaysia",
+    # Filipinas (Manila)
+    "SM.PS": "SM Investments (Filipinas)", "BDO.PS": "BDO Unibank (Filipinas)",
+    "TEL.PS": "PLDT (Filipinas)", "ALI.PS": "Ayala Land (Filipinas)",
+    "JFC.PS": "Jollibee Foods (Filipinas)",
+    # Vietnam
+    "VNM.HM": "Vinamilk (Vietnam)", "VHM.HM": "Vinhomes (Vietnam)",
+    "VIC.HM": "Vingroup (Vietnam)", "HPG.HM": "Hoa Phat (Vietnam)",
+    "FPT.HM": "FPT Corp (Vietnam)",
+    # Arabia Saudi (Tadawul)
+    "2222.SR": "Saudi Aramco (Tadawul)", "1180.SR": "Al Rajhi Bank (Tadawul)",
+    "2010.SR": "SABIC (Tadawul)", "7010.SR": "STC (Tadawul)",
+    "1150.SR": "Saudi Awakening (Tadawul)", "2350.SR": "Saudi Kayan (Tadawul)",
+    # Emiratos Arabes (Abu Dhabi / Dubai)
+    "FAB.AE": "First Abu Dhabi Bank", "ADNOCDIST.AE": "ADNOC Distribution",
+    "IHC.AE": "Intl Holding Company (Abu Dhabi)", "DFM.AE": "Dubai Financial Market",
+    "EMAAR.AE": "Emaar Properties (Dubai)",
+    # Israel (Tel Aviv)
+    "LUMI.TA": "Bank Leumi (Tel Aviv)", "DSCT.TA": "Bank Discount (Tel Aviv)",
+    "BEZQ.TA": "Bezeq (Tel Aviv)", "ICL.TA": "ICL Group (Tel Aviv)",
+    "TEVA.TA": "Teva Pharma (Tel Aviv)",
+    # Sudafrica (JSE Johannesburg)
+    "NPN.JO": "Naspers (Johannesburg)", "SOL.JO": "Sasol (Johannesburg)",
+    "SBK.JO": "Standard Bank (Johannesburg)", "FSR.JO": "FirstRand (Johannesburg)",
+    "AGL.JO": "Anglo American (Johannesburg)", "BTI.JO": "BAT (Johannesburg)",
+    "MTN.JO": "MTN Group (Johannesburg)", "VOD.JO": "Vodacom (Johannesburg)",
+    "SHP.JO": "Shoprite (Johannesburg)", "CFR.JO": "Richemont (Johannesburg)",
+    "BID.JO": "Bid Corp (Johannesburg)", "AMS.JO": "Anglo American Plat (Johannesburg)",
+}
+
+# ── Internacional: Latinoamerica locales ──
+_LATAM_LOCAL: dict[str, str] = {
+    # Brasil – Bovespa principales (B3 Sao Paulo)
+    "PETR4.SA": "Petrobras (Brasil)", "VALE3.SA": "Vale (Brasil)",
+    "ITUB4.SA": "Itau Unibanco (Brasil)", "BBDC4.SA": "Bradesco (Brasil)",
+    "WEGE3.SA": "WEG (Brasil)", "RENT3.SA": "Localiza (Brasil)",
+    "BBAS3.SA": "Banco do Brasil (Brasil)", "ABEV3.SA": "Ambev (Brasil)",
+    "SUZB3.SA": "Suzano (Brasil)", "ELET3.SA": "Eletrobras (Brasil)",
+    "B3SA3.SA": "B3 Bolsa Brasil", "HAPV3.SA": "Hapvida (Brasil)",
+    "RAIL3.SA": "Rumo (Brasil)", "JBSS3.SA": "JBS (Brasil)",
+    "RDOR3.SA": "Rede D'Or (Brasil)", "LREN3.SA": "Lojas Renner (Brasil)",
+    "EQTL3.SA": "Equatorial Energia (Brasil)", "PRIO3.SA": "PRIO (Brasil)",
+    "CSAN3.SA": "Cosan (Brasil)", "VIVT3.SA": "Telefonica Brasil",
+    "SBSP3.SA": "Sabesp (Brasil)", "TOTS3.SA": "TOTVS (Brasil)",
+    "RADL3.SA": "RaiaDrogasil (Brasil)", "ENEV3.SA": "Eneva (Brasil)",
+    "BBSE3.SA": "BB Seguridade (Brasil)", "CMIG4.SA": "Cemig (Brasil)",
+    "CPLE6.SA": "Copel (Brasil)", "EMBR3.SA": "Embraer (Brasil)",
+    "VBBR3.SA": "Vibra Energia (Brasil)", "MGLU3.SA": "Magazine Luiza (Brasil)",
+    # Mexico – BMV principales
+    "FEMSAUBD.MX": "FEMSA (Mexico)", "WALMEX.MX": "Walmart Mexico",
+    "GFNORTEO.MX": "Banorte (Mexico)", "CEMEXCPO.MX": "Cemex (Mexico)",
+    "GMEXICOB.MX": "Grupo Mexico", "BIMBOA.MX": "Bimbo (Mexico)",
+    "TABORAB.MX": "Organizacion Soriana (Mexico)",
+    "AC.MX": "Arca Continental (Mexico)", "ALSEA.MX": "Alsea (Mexico)",
+    "LIVEPOLC-1.MX": "Liverpool (Mexico)", "PE&OLES.MX": "Penoles (Mexico)",
+    "GCARSOA1.MX": "Grupo Carso (Mexico)", "ORABORAB.MX": "Grupo Elektra (Mexico)",
+    "GENTERA.MX": "Gentera (Mexico)", "MEGACPO.MX": "Megacable (Mexico)",
+    "GRUMAB.MX": "Gruma (Mexico)",
+    # Argentina (Buenos Aires)
+    "GGAL.BA": "Grupo Galicia (Buenos Aires)", "YPF.BA": "YPF (Buenos Aires)",
+    "BMA.BA": "Banco Macro (Buenos Aires)", "PAMP.BA": "Pampa Energia (Buenos Aires)",
+    "TXAR.BA": "Ternium Argentina (Buenos Aires)", "CEPU.BA": "Central Puerto (Buenos Aires)",
+    "TGSU2.BA": "TGS (Buenos Aires)", "SUPV.BA": "Supervielle (Buenos Aires)",
+    # Colombia (BVC Bogota)
+    "EC": "Ecopetrol (ADR Colombia)", "PFBCOLOM.CL": "Bancolombia (Bogota)",
+    "ISA.CL": "ISA (Bogota)", "NUTRESA.CL": "Nutresa (Bogota)",
+    "GRUPOARGOS.CL": "Grupo Argos (Bogota)",
+    # Peru
+    "BVN": "Buenaventura (ADR Peru)", "SCCO": "Southern Copper (Peru)",
+    "BAP": "Credicorp (ADR Peru)", "IFS": "Intercorp Financial (Peru)",
+    # Chile (Santiago)
+    "FALABELLA.SN": "Falabella (Chile)", "CHILE.SN": "Banco de Chile",
+    "CENCOSUD.SN": "Cencosud (Chile)", "SQM-B.SN": "SQM (Chile)",
+    "COPEC.SN": "Copec (Chile)", "VAPORES.SN": "CSAV (Chile)",
+    "BSANTANDER.SN": "Santander Chile", "CCU.SN": "CCU (Chile)",
+    "ENELAM.SN": "Enel Americas (Chile)", "CMPC.SN": "CMPC (Chile)",
 }
 
 # ── ETFs (100) ──
@@ -474,6 +790,7 @@ for _group in (_US_TECH, _US_HEALTH, _US_FINANCE, _US_CONSUMER_DISC,
 TICKERS.update(_build("Accion", _INTL_ADR))
 TICKERS.update(_build("Accion", _EU_LOCAL))
 TICKERS.update(_build("Accion", _ASIA_LOCAL))
+TICKERS.update(_build("Accion", _LATAM_LOCAL))
 TICKERS.update(_build("ETF", _ETFS))
 TICKERS.update(_build("Commodity", _COMMODITIES))
 TICKERS.update(_build("Cripto", _CRYPTO))
@@ -683,6 +1000,7 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
     except Exception:
         pass
 
+    failed_tickers: list[str] = []
     for ticker, meta in TICKERS.items():
         try:
             if len(tickers_list) > 1:
@@ -691,6 +1009,7 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
                 close = data["Close"].dropna()
 
             if close.empty:
+                failed_tickers.append(ticker)
                 continue
 
             precio_actual = close.iloc[-1]
@@ -744,8 +1063,9 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
                     last_vol = float(vol_series.iloc[-1])
                     if avg_vol_20d > 0:
                         vol_ratio = last_vol / avg_vol_20d
+                volume_hist = vol_series.tolist() if len(vol_series) > 0 else []
             except Exception:
-                pass
+                volume_hist = []
 
             # Fuerza relativa vs S&P 500 (exceso de retorno)
             rs_vs_sp500 = None
@@ -760,23 +1080,41 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
             # Bollinger Bands (20, 2σ)
             bb_data = _compute_bollinger(close)
 
-            # ADX (14) - necesita High y Low
-            adx_val = None
+            # OHLC historico (para graficos de velas)
+            open_hist: list[float] = []
+            high_hist: list[float] = []
+            low_hist: list[float] = []
+            dates_hist: list[str] = []
             try:
                 if len(tickers_list) > 1:
+                    open_s = data["Open"][ticker].dropna()
                     high_s = data["High"][ticker].dropna()
                     low_s = data["Low"][ticker].dropna()
                 else:
+                    open_s = data["Open"].dropna()
                     high_s = data["High"].dropna()
                     low_s = data["Low"].dropna()
+                open_hist = open_s.tolist()
+                high_hist = high_s.tolist()
+                low_hist = low_s.tolist()
+                dates_hist = [d.strftime("%Y-%m-%d") for d in close.index]
+            except Exception:
+                open_s = pd.Series(dtype=float)
+                high_s = pd.Series(dtype=float)
+                low_s = pd.Series(dtype=float)
+
+            # ADX (14) - necesita High y Low
+            adx_val = None
+            try:
                 # Alinear indices
-                common_idx = close.index.intersection(high_s.index).intersection(low_s.index)
-                if len(common_idx) > 42:
-                    adx_val = _compute_adx(
-                        high_s.loc[common_idx],
-                        low_s.loc[common_idx],
-                        close.loc[common_idx],
-                    )
+                if not high_s.empty and not low_s.empty:
+                    common_idx = close.index.intersection(high_s.index).intersection(low_s.index)
+                    if len(common_idx) > 42:
+                        adx_val = _compute_adx(
+                            high_s.loc[common_idx],
+                            low_s.loc[common_idx],
+                            close.loc[common_idx],
+                        )
             except Exception:
                 pass
 
@@ -791,6 +1129,11 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
                 "sma50": sma50, "sma200": sma200, "rsi14": rsi14,
                 "vol_20d": vol_20d, "max_dd_12m": max_dd, "dist_high_52w": dist_high,
                 "close_hist": close.tolist(),
+                "open_hist": open_hist,
+                "high_hist": high_hist,
+                "low_hist": low_hist,
+                "dates_hist": dates_hist,
+                "volume_hist": volume_hist,
                 # Indicadores de momentum
                 "macd": macd_data["macd"],
                 "macd_signal": macd_data["macd_signal"],
@@ -810,9 +1153,12 @@ def fetch_price_data(months: int = 12) -> dict[str, dict[str, Any]]:
                 "rsi_divergence": rsi_divergence,
             }
         except Exception:
+            failed_tickers.append(ticker)
             continue
 
     print(f"  Datos obtenidos para {len(results)} de {len(tickers_list)} activos.", flush=True)
+    if failed_tickers:
+        print(f"  Sin datos ({len(failed_tickers)}): {', '.join(sorted(failed_tickers))}", flush=True)
     return results
 
 
@@ -858,8 +1204,10 @@ def _fetch_single_fundamental(ticker_str: str) -> tuple[str, dict[str, Any] | No
         return ticker_str, None
 
 
-def fetch_fundamentals(max_workers: int = 8) -> dict[str, dict[str, Any]]:
+def fetch_fundamentals(max_workers: int = 0) -> dict[str, dict[str, Any]]:
     """Obtiene metricas fundamentales con descarga concurrente."""
+    if max_workers <= 0:
+        max_workers = _DEFAULT_WORKERS
     n = len(FUNDAMENTAL_TICKERS)
     print(f"  Obteniendo fundamentales de {n} acciones (concurrente x{max_workers})...", flush=True)
     results: dict[str, dict[str, Any]] = {}
@@ -1086,13 +1434,25 @@ def load_all_market_data(months: int = 12, include_raw: bool = False) -> dict[st
         print("=" * 60 + "\n")
         return cached
 
+    # Limpiar cache obsoleta (>3 dias)
+    removed = _cache_cleanup()
+    if removed:
+        print(f"  Cache: {removed} archivos obsoletos eliminados.")
+
     print("\n" + "=" * 60)
     print("CARGANDO DATOS REALES DE MERCADO")
-    print(f"Universo: {len(TICKERS)} activos")
+    print(f"Universo: {len(TICKERS)} activos | Workers: {_DEFAULT_WORKERS}")
     print("=" * 60)
 
-    prices = fetch_price_data(months=months)
-    fundamentals = fetch_fundamentals()
+    # Descargar precios y fundamentales en paralelo (son independientes)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_prices = pool.submit(fetch_price_data, months)
+        fut_fundamentals = pool.submit(fetch_fundamentals)
+        prices = fut_prices.result()
+        fundamentals = fut_fundamentals.result()
+
+    # Liberar memoria de DataFrames temporales de yfinance
+    gc.collect()
 
     if not prices:
         print("  ADVERTENCIA: No se pudieron obtener datos de mercado.", file=sys.stderr)
