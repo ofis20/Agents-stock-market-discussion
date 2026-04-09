@@ -78,10 +78,10 @@ CONSENSUS_FILLERS = [
 def build_agent_turn_prompt(context: str, market_briefing: str = "") -> str:
     market_block = ""
     if market_briefing:
-        market_block = f"\n\nDATOS REALES DE MERCADO (usa estos datos, NO inventes cifras):\n{market_briefing}\n"
+        market_block = f"\n\nDATOS REALES DE MERCADO, ECONOMIA, EARNINGS Y NOTICIAS (usa estos datos, NO inventes cifras):\n{market_briefing}\n"
     return textwrap.dedent(
         f"""
-        Debate de macroeconomia global e inversiones en marzo de 2026 entre siete inversores legendarios.
+        Debate de macroeconomia global e inversiones en 2026 entre siete inversores legendarios.
         ENFOQUE: Que activos van a hacerlo BIEN en 2026 y 2027. NO recomiendes activos solo porque subieron en el pasado.
         {market_block}
         Reglas para este turno:
@@ -91,6 +91,7 @@ def build_agent_turn_prompt(context: str, market_briefing: str = "") -> str:
         - OBLIGATORIO: menciona al menos 1 empresa, ETF, commodity, divisa, bono o activo concreto y real.
         - PROSPECTIVO: explica POR QUE ese activo va a hacerlo bien en 2026-2027 (catalizadores futuros, no rendimiento pasado).
         - USA LOS DATOS REALES proporcionados arriba como referencia del estado actual.
+        - USA los datos de EARNINGS, ECONOMIA (FRED) y NOTICIAS para fundamentar tus argumentos con contexto real.
         - Incluye 1 tesis concreta sobre el FUTURO de ese activo y 1 riesgo principal.
         - Cierra con una propuesta breve para acercar consenso sobre las mejores inversiones para 2026-2027.
 
@@ -104,7 +105,8 @@ def build_consensus_messages(context: str, market_briefing: str = "") -> tuple[s
     system = (
         "Eres moderador neutral. Debes extraer consenso final entre los siete participantes. "
         "Tu salida final debe ser exactamente 10 lineas en espanol, sin encabezados ni numeracion. "
-        "USA LOS DATOS REALES DE MERCADO proporcionados para fundamentar el consenso, NO inventes cifras."
+        "USA LOS DATOS REALES DE MERCADO, DATOS ECONOMICOS, EARNINGS y NOTICIAS proporcionados "
+        "para fundamentar el consenso, NO inventes cifras."
     )
     data_block = f"\n\nDATOS REALES DE MERCADO:\n{market_briefing}\n" if market_briefing else ""
     user = textwrap.dedent(

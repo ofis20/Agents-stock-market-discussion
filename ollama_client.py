@@ -17,10 +17,13 @@ if TYPE_CHECKING:
 DEFAULT_HOST = "http://127.0.0.1:11434"
 
 # Opciones de rendimiento para Ollama (configurables via env)
-_NUM_THREAD = int(os.environ.get("OLLAMA_NUM_THREAD", 0)) or os.cpu_count() or 4
-_NUM_GPU = int(os.environ.get("OLLAMA_NUM_GPU", 99))    # 99 = todas las capas en GPU
-_NUM_BATCH = int(os.environ.get("OLLAMA_NUM_BATCH", 512))
-_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+# Usar cores fisicos (no hyperthreads) es optimo para inferencia AVX-512
+_PHYSICAL_CORES = (os.cpu_count() or 4) // 2
+_NUM_THREAD = int(os.environ.get("OLLAMA_NUM_THREAD", 0)) or _PHYSICAL_CORES
+_NUM_GPU = int(os.environ.get("OLLAMA_NUM_GPU", 99))    # 99 = max capas en GPU, resto a CPU/RAM
+_NUM_BATCH = int(os.environ.get("OLLAMA_NUM_BATCH", 1024))  # Batch grande: 30GB RAM lo permite
+_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "60m")   # Mantener modelos cargados entre turnos
+_REQUEST_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", 300))  # 5min para modelos grandes en offload
 
 
 PREFERRED_MODELS = [
@@ -60,16 +63,30 @@ def sort_models_by_preference(models: list[str]) -> list[str]:
     return sorted(models, key=_priority)
 
 
+MODERATOR_ROLES = {"Moderador Consenso", "Moderador Top 20", "Veredicto Final", "Analista Elliott"}
+
+
 def assign_models_to_agents(available_models: list[str], agents: list["Agent"], analyst_roles: list[str]) -> dict[str, str]:
-    """Asigna modelos diversos a agentes y analistas."""
+    """Asigna modelos diversos a agentes y analistas.
+
+    Los moderadores siempre reciben el mejor modelo disponible (primero en
+    orden de preferencia) para maximizar la calidad del consenso y veredicto.
+    """
     general_models = sort_models_by_preference(filter_general_models(available_models))
 
     if not general_models:
         raise RuntimeError("No hay modelos instalados en Ollama.")
 
+    best_model = general_models[0]
+
     all_roles = [agent.name for agent in agents] + analyst_roles
     assignment: dict[str, str] = {}
     available_for_auto = general_models[:]
+
+    # Moderadores: siempre el mejor modelo
+    for role in all_roles:
+        if role in MODERATOR_ROLES:
+            assignment[role] = best_model
 
     for agent in agents:
         if agent.model and agent.model in available_models:
@@ -145,7 +162,7 @@ class OllamaClient:
         }
 
         full_text = ""
-        chat_resp = requests.post(chat_url, json=chat_payload, stream=True, timeout=120)
+        chat_resp = requests.post(chat_url, json=chat_payload, stream=True, timeout=_REQUEST_TIMEOUT)
 
         if chat_resp.status_code == 404:
             chat_resp.close()
@@ -241,7 +258,7 @@ class OllamaClient:
         }
 
         full_text = ""
-        with requests.post(generate_url, json=payload, stream=True, timeout=120) as resp:
+        with requests.post(generate_url, json=payload, stream=True, timeout=_REQUEST_TIMEOUT) as resp:
             resp.raise_for_status()
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line:

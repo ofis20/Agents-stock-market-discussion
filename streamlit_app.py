@@ -19,8 +19,14 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-from debate_portfolio import classify_elliott_wave, find_zigzag_pivots
+from debate_portfolio import classify_elliott_wave, find_zigzag_pivots, label_elliott_wave_pivots
 from market_data import TICKERS as _TICKER_DB
+from portfolio_tracker import (
+    add_position, close_position, delete_position,
+    get_open_positions, get_closed_positions,
+    portfolio_snapshot, portfolio_risk_summary,
+    compute_exit_signals, compute_performance_report, compute_entry_levels,
+)
 
 
 def _ticker_label(ticker: str) -> str:
@@ -1247,6 +1253,175 @@ def render_price_alerts() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3b-2. SEÑALES DE SALIDA
+# ═══════════════════════════════════════════════════════════════════════════
+
+def render_exit_signals() -> None:
+    """Muestra señales de salida basadas en deterioro de tesis vs posiciones abiertas."""
+    st.subheader("Señales de salida")
+    st.caption("Compara tus posiciones abiertas con las recomendaciones actuales del sistema.")
+
+    positions = get_open_positions()
+    if positions.empty:
+        st.info("No tienes posiciones registradas. Ve a **Mi Cartera** para añadir tus posiciones reales.")
+        return
+
+    # Cargar scoreboard más reciente
+    prev_df = _load_previous_scoreboard()
+    signals = compute_exit_signals(prev_df)
+
+    if not signals:
+        st.success("Sin señales de salida. Todas tus posiciones están alineadas con las recomendaciones.")
+        return
+
+    # Métricas resumen
+    alta = sum(1 for s in signals if s["urgencia"] == "ALTA")
+    media = sum(1 for s in signals if s["urgencia"] == "MEDIA")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Señales urgentes", alta)
+    c2.metric("Señales moderadas", media)
+    c3.metric("Total posiciones", len(positions))
+
+    # Tabla de señales
+    for s in signals:
+        urgencia = s["urgencia"]
+        if urgencia == "ALTA":
+            color = "#ef4444"
+            icon = "🔴"
+        else:
+            color = "#f59e0b"
+            icon = "🟡"
+
+        st.markdown(
+            f"{icon} **{s['ticker']}** — "
+            f"<span style='color:{color};font-weight:700'>{s['señal']}</span> "
+            f"| P&L: {s['pnl_pct']:+.1f}% | {s['motivo']}",
+            unsafe_allow_html=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b-3. PERFORMANCE TRACKING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def render_performance() -> None:
+    """Muestra el rendimiento real de las recomendaciones pasadas."""
+    st.subheader("Performance de recomendaciones")
+    st.caption("¿Cuánto habrías ganado/perdido siguiendo las señales del sistema?")
+
+    report = compute_performance_report()
+    if not report:
+        st.info("Necesitas al menos 2 ejecuciones con datos de precio para ver el performance.")
+        return
+
+    total = report.get("total_recommendations", 0)
+    st.markdown(f"**{total}** recomendaciones analizadas en el histórico.")
+
+    for decision in ["COMPRAR", "VIGILAR", "EVITAR"]:
+        stats = report.get(decision, {})
+        if not stats or stats.get("count", 0) == 0:
+            continue
+
+        if decision == "COMPRAR":
+            color = "#22c55e"
+        elif decision == "VIGILAR":
+            color = "#eab308"
+        else:
+            color = "#ef4444"
+
+        st.markdown(f"### <span style='color:{color}'>{decision}</span>", unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Aciertos", f"{stats.get('hit_rate', 0):.0f}%",
+                  delta=f"{stats.get('wins', 0)}/{stats.get('count', 0)}")
+        c2.metric("Rent. media", f"{stats.get('avg_return', 0):+.1f}%")
+        c3.metric("Mejor", f"{stats.get('best', 0):+.1f}%")
+        c4.metric("Peor", f"{stats.get('worst', 0):+.1f}%")
+
+        details = stats.get("details", [])
+        if details:
+            df = pd.DataFrame(details)
+            df = df.rename(columns={
+                "ticker": "Ticker", "date": "Fecha rec.",
+                "price_rec": "Precio rec.", "price_now": "Precio actual",
+                "return_pct": "Rent. %", "puntaje": "Puntaje",
+            })
+
+            def _color_return(val):
+                if isinstance(val, (int, float)):
+                    if val > 0:
+                        return "color: #22c55e"
+                    elif val < 0:
+                        return "color: #ef4444"
+                return ""
+
+            styled = df.style.applymap(_color_return, subset=["Rent. %"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b-4. NIVELES DE ENTRADA
+# ═══════════════════════════════════════════════════════════════════════════
+
+def render_entry_levels() -> None:
+    """Muestra niveles de entrada óptimos para los activos del Top 20."""
+    st.subheader("Niveles de entrada")
+    st.caption("Zonas de soporte técnico y señales de timing para cada activo recomendado.")
+
+    prev_df = _load_previous_scoreboard()
+    if prev_df.empty:
+        st.info("Ejecuta un debate primero para ver niveles de entrada.")
+        return
+
+    # Filtrar solo COMPRAR y VIGILAR
+    buy_watch = prev_df[
+        prev_df["Decision sugerida"].str.upper().isin(["COMPRAR", "VIGILAR"])
+    ] if "Decision sugerida" in prev_df.columns else prev_df
+
+    tickers = buy_watch["Ticker"].tolist() if not buy_watch.empty else []
+    if not tickers:
+        st.info("No hay activos con decisión COMPRAR o VIGILAR.")
+        return
+
+    with st.spinner("Calculando niveles de entrada..."):
+        levels = compute_entry_levels(tickers)
+
+    if not levels:
+        st.warning("No se pudieron calcular niveles de entrada.")
+        return
+
+    df = pd.DataFrame(levels)
+
+    # Color por timing
+    def _color_timing(val):
+        s = str(val)
+        if "AHORA" in s:
+            return "background-color: rgba(34,197,94,0.2)"
+        elif "ESPERAR" in s:
+            return "background-color: rgba(239,68,68,0.15)"
+        elif "CERCANO" in s:
+            return "background-color: rgba(234,179,8,0.15)"
+        return ""
+
+    styled = df.style.applymap(_color_timing, subset=["Timing"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # Resumen rápido
+    ahora = [l for l in levels if "AHORA" in l["Timing"]]
+    cercano = [l for l in levels if "CERCANO" in l["Timing"]]
+    esperar = [l for l in levels if "ESPERAR" in l["Timing"]]
+
+    if ahora:
+        st.success(f"**Entrada óptima ahora:** {', '.join(l['Ticker'] for l in ahora)}")
+    if cercano:
+        st.warning(f"**Cerca de zona de entrada:** {', '.join(l['Ticker'] for l in cercano)}")
+    if esperar:
+        st.info(f"**Esperar pullback:** {', '.join(l['Ticker'] for l in esperar)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 3c. DASHBOARD MULTI-EJECUCION
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1568,8 +1743,8 @@ def render_correlation(top10_df: pd.DataFrame) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600, show_spinner="Descargando datos OHLCV...")
-def _fetch_ohlcv(ticker: str, months: int = 60) -> pd.DataFrame | None:
-    """Descarga datos OHLCV semanales de un ticker (5 anos por defecto)."""
+def _fetch_ohlcv(ticker: str, months: int = 120) -> pd.DataFrame | None:
+    """Descarga datos OHLCV semanales de un ticker (10 anos por defecto)."""
     from datetime import timedelta
     end = datetime.now()
     start = end - timedelta(days=months * 30)
@@ -1610,66 +1785,81 @@ def _compute_stoch_rsi(series: pd.Series, rsi_period: int = 14, stoch_period: in
 
 
 def _add_elliott_overlay(fig: go.Figure, df: pd.DataFrame) -> dict:
-    """Anade el zigzag de Elliott Wave al grafico de velas y devuelve info de onda."""
+    """Dibuja ondas de Elliott etiquetadas (1-5 impulso, A-B-C correccion) sobre el grafico."""
     closes = df["Close"].tolist()
     if len(closes) < 60:
         return {}
 
     ew = classify_elliott_wave(closes)
-    pivots = find_zigzag_pivots(closes[-252:] if len(closes) >= 252 else closes, pct_threshold=5.0)
+    # Reusar los pivots adaptativos del clasificador (misma estructura que el grafico)
+    pivots = ew.get("_pivots") or find_zigzag_pivots(closes, pct_threshold=5.0)
     if not pivots:
         return ew
 
-    # Mapear indices de pivots a fechas del DataFrame
-    offset = max(0, len(closes) - 252)
-    pivot_dates = []
-    pivot_prices = []
-    for idx, price, ptype in pivots:
-        real_idx = idx + offset
-        if real_idx < len(df):
-            pivot_dates.append(df.index[real_idx])
-            pivot_prices.append(price)
+    labeled = label_elliott_wave_pivots(pivots)
 
-    if len(pivot_dates) >= 2:
-        # Linea zigzag
+    # Mapear a fechas del DataFrame — solo pivots con etiqueta de onda
+    dated: list[tuple] = []
+    for idx, price, ptype, label in labeled:
+        if label and idx < len(df):
+            dated.append((df.index[idx], price, ptype, label))
+
+    if len(dated) < 2:
+        return ew
+
+    # --- Segmentos coloreados conectando las ondas etiquetadas ---
+    _SEG_COLORS = {
+        "1": "#22c55e", "3": "#22c55e", "5": "#22c55e",  # impulso
+        "2": "#eab308", "4": "#eab308",                    # correccion interna
+        "A": "#ef4444", "B": "#ef4444", "C": "#ef4444",    # corrección ABC
+        "0": "#94a3b8",
+    }
+    for i in range(len(dated) - 1):
+        d1, p1, _, _ = dated[i]
+        d2, p2, _, l2 = dated[i + 1]
+        seg_color = _SEG_COLORS.get(l2, "#94a3b8")
         fig.add_trace(go.Scatter(
-            x=pivot_dates, y=pivot_prices,
-            mode="lines", name="Elliott Zigzag",
-            line=dict(color="#ffd600", width=2, dash="dot"),
-            opacity=0.8,
+            x=[d1, d2], y=[p1, p2],
+            mode="lines",
+            line=dict(color=seg_color, width=2.5),
+            showlegend=False,
+            hoverinfo="skip",
         ))
 
-    # Marcadores en cada pivot con etiqueta H/L
-    _WAVE_COLORS = {"H": "#4ade80", "L": "#f87171"}
-    for i, (idx, price, ptype) in enumerate(pivots):
-        real_idx = idx + offset
-        if real_idx >= len(df):
-            continue
-        date = df.index[real_idx]
+    # --- Etiquetas de onda en cada pivot ---
+    _LABEL_STYLE = {
+        "0": ("#94a3b8", 7, 11),
+        "1": ("#4ade80", 10, 15), "3": ("#34d399", 10, 15), "5": ("#4ade80", 10, 15),
+        "2": ("#facc15", 10, 15), "4": ("#facc15", 10, 15),
+        "A": ("#f87171", 10, 15), "C": ("#f87171", 10, 15),
+        "B": ("#fb923c", 10, 15),
+    }
+    for date, price, ptype, label in dated:
+        color, msize, fsize = _LABEL_STYLE.get(label, ("#94a3b8", 8, 11))
+        position = "top center" if ptype == "H" else "bottom center"
         fig.add_trace(go.Scatter(
             x=[date], y=[price],
             mode="markers+text",
-            marker=dict(size=9, color=_WAVE_COLORS.get(ptype, "#fff"), symbol="diamond"),
-            text=[ptype],
-            textposition="top center" if ptype == "H" else "bottom center",
-            textfont=dict(size=10, color=_WAVE_COLORS.get(ptype, "#fff")),
+            marker=dict(size=msize, color=color, symbol="diamond"),
+            text=[label],
+            textposition=position,
+            textfont=dict(size=fsize, color=color, family="Arial Black"),
             showlegend=False,
-            hovertext=f"{ptype} {price:.2f}",
+            hovertext=f"Onda {label}: ${price:.2f}",
             hoverinfo="text",
         ))
 
-    # Lineas horizontales de targets
-    last_date = df.index[-1]
-    if ew.get("target_1m", 0) > 0:
-        for label, key, color, dash in [
-            ("Target 1m", "target_1m", "#42a5f5", "dash"),
-            ("Target 3m", "target_3m", "#ff9800", "dash"),
-            ("Target 6m", "target_6m", "#ab47bc", "dashdot"),
+    # --- Lineas horizontales de targets ---
+    if ew.get("target_1y", 0) > 0:
+        for tgt_label, key, color, dash in [
+            ("Target 1y", "target_1y", "#42a5f5", "dash"),
+            ("Target 3y", "target_3y", "#ff9800", "dash"),
+            ("Target 6y", "target_6y", "#ab47bc", "dashdot"),
         ]:
             val = ew[key]
             fig.add_hline(
                 y=val, line_dash=dash, line_color=color, line_width=0.8,
-                annotation_text=f"{label}: ${val:.2f}",
+                annotation_text=f"{tgt_label}: ${val:.2f}",
                 annotation_position="top right",
                 annotation_font_color=color,
                 annotation_font_size=10,
@@ -1723,7 +1913,7 @@ def _build_candlestick_figure(df: pd.DataFrame, ticker: str) -> tuple[go.Figure,
         title_ew = f" | Onda {ew['onda']} — {ew.get('fase', '')}"
 
     fig.update_layout(
-        title=f"{_ticker_label(ticker)} — Semanal (5 anos){title_ew}",
+        title=f"{_ticker_label(ticker)} — Semanal (10 anos){title_ew}",
         yaxis_title="Precio",
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
@@ -1824,7 +2014,7 @@ def render_candlestick(top10_df: pd.DataFrame, score_df: pd.DataFrame, pass_id: 
     if not tickers:
         return
 
-    st.subheader("Graficos de velas — Semanal (5 anos) con Ondas de Elliott")
+    st.subheader("Graficos de velas — Semanal (10 anos) con Ondas de Elliott")
 
     # Pre-seleccionar solo los COMPRAR si hay scoreboard
     default_tickers = tickers[:5]
@@ -1864,9 +2054,9 @@ def render_candlestick(top10_df: pd.DataFrame, score_df: pd.DataFrame, pass_id: 
             _color = "#4ade80" if ew["onda"] in _favorable else "#f87171"
             e1, e2, e3, e4 = st.columns(4)
             e1.markdown(f"**Onda:** <span style='color:{_color};font-size:1.3em;font-weight:700'>{ew['onda']}</span> — {ew.get('fase', '')}", unsafe_allow_html=True)
-            e2.metric("Target 1m", f"${ew['target_1m']:.2f}", f"{ew['rent_1m']:+.1f}%")
-            e3.metric("Target 3m", f"${ew['target_3m']:.2f}", f"{ew['rent_3m']:+.1f}%")
-            e4.metric("Target 6m", f"${ew['target_6m']:.2f}", f"{ew['rent_6m']:+.1f}%")
+            e2.metric("Target 1y", f"${ew['target_1y']:.2f}", f"{ew['rent_1y']:+.1f}%")
+            e3.metric("Target 3y", f"${ew['target_3y']:.2f}", f"{ew['rent_3y']:+.1f}%")
+            e4.metric("Target 6y", f"${ew['target_6y']:.2f}", f"{ew['rent_6y']:+.1f}%")
             st.caption(f"📊 {ew.get('prevision', '')}")
 
         volume_fig = _build_volume_figure(ohlcv, ticker)
@@ -2144,7 +2334,7 @@ def render_results(full_output: str) -> None:
             pass2_output = full_output[idx2:idx3]
             pass3_output = full_output[idx3:]
 
-            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs([
+            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13 = st.tabs([
                 "Resumen Pasada 1",
                 "Tablas Pasada 1",
                 "Resumen Pasada 2 (sin EVITAR)",
@@ -2153,6 +2343,9 @@ def render_results(full_output: str) -> None:
                 "Tablas Pasada 3",
                 "Flujo entre pasadas",
                 "Alertas de precio",
+                "Señales de salida",
+                "Niveles de entrada",
+                "Performance",
                 "Dashboard",
                 "Historico",
             ])
@@ -2174,19 +2367,28 @@ def render_results(full_output: str) -> None:
             with t8:
                 render_price_alerts()
             with t9:
-                render_dashboard()
+                render_exit_signals()
             with t10:
+                render_entry_levels()
+            with t11:
+                render_performance()
+            with t12:
+                render_dashboard()
+            with t13:
                 render_history_tab()
         else:
             pass2_output = full_output[idx2:]
 
-            t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11 = st.tabs([
                 "Resumen Pasada 1",
                 "Tablas Pasada 1",
                 "Resumen Pasada 2 (sin EVITAR)",
                 "Tablas Pasada 2",
                 "Flujo entre pasadas",
                 "Alertas de precio",
+                "Señales de salida",
+                "Niveles de entrada",
+                "Performance",
                 "Dashboard",
                 "Historico",
             ])
@@ -2204,11 +2406,21 @@ def render_results(full_output: str) -> None:
             with t6:
                 render_price_alerts()
             with t7:
-                render_dashboard()
+                render_exit_signals()
             with t8:
+                render_entry_levels()
+            with t9:
+                render_performance()
+            with t10:
+                render_dashboard()
+            with t11:
                 render_history_tab()
     else:
-        t1, t2, t3, t4, t5 = st.tabs(["Resumen", "Tablas de evaluacion", "Alertas de precio", "Dashboard", "Historico"])
+        t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+            "Resumen", "Tablas de evaluacion", "Alertas de precio",
+            "Señales de salida", "Niveles de entrada", "Performance",
+            "Dashboard", "Historico",
+        ])
         with t1:
             _render_pass_summary(full_output)
         with t2:
@@ -2216,8 +2428,14 @@ def render_results(full_output: str) -> None:
         with t3:
             render_price_alerts()
         with t4:
-            render_dashboard()
+            render_exit_signals()
         with t5:
+            render_entry_levels()
+        with t6:
+            render_performance()
+        with t7:
+            render_dashboard()
+        with t8:
             render_history_tab()
 
 
@@ -2242,6 +2460,11 @@ def main() -> None:
 
     tab_debate, tab_portfolio = st.tabs(["Debate Macro", "Mi Cartera"])
 
+    # Inicializar session_state para persistir resultados entre reruns
+    for _key in ("debate_code", "debate_output", "portfolio_code", "portfolio_output"):
+        if _key not in st.session_state:
+            st.session_state[_key] = None
+
     # ── TAB 1: Debate Macro (flujo original) ──
     with tab_debate:
         run_clicked = st.button("Iniciar debate", type="primary", use_container_width=True, key="btn_debate")
@@ -2255,19 +2478,8 @@ def main() -> None:
                 context_lines=int(context_lines),
             )
             code, full_output = stream_process(cmd)
-
-            st.divider()
-            st.subheader("Resultado")
-            if code == 0:
-                st.success("Ejecucion completada.")
-            else:
-                st.error("La ejecucion termino con errores. Revisa la salida completa.")
-
-            consensus = extract_consensus(full_output)
-            if consensus:
-                st.info(f"**Conclusion macroeconomica de los agentes:**\n\n{consensus}")
-
-            render_timer(full_output)
+            st.session_state["debate_code"] = code
+            st.session_state["debate_output"] = full_output
 
             # Guardar en historico (siempre la ultima pasada disponible)
             if code == 0:
@@ -2282,6 +2494,23 @@ def main() -> None:
                 score_df = build_scoreboard(top10_df, tables)
                 _save_run(model.strip(), score_df, full_output)
 
+        # Renderizar siempre que haya resultados guardados
+        if st.session_state["debate_output"] is not None:
+            full_output = st.session_state["debate_output"]
+            code = st.session_state["debate_code"]
+
+            st.divider()
+            st.subheader("Resultado")
+            if code == 0:
+                st.success("Ejecucion completada.")
+            else:
+                st.error("La ejecucion termino con errores. Revisa la salida completa.")
+
+            consensus = extract_consensus(full_output)
+            if consensus:
+                st.info(f"**Conclusion macroeconomica de los agentes:**\n\n{consensus}")
+
+            render_timer(full_output)
             render_results(full_output)
 
             st.download_button(
@@ -2294,40 +2523,158 @@ def main() -> None:
 
     # ── TAB 2: Mi Cartera ──
     with tab_portfolio:
-        st.subheader("Analiza tu cartera personal")
-        st.markdown(
-            "Introduce los tickers de los activos que tienes en cartera. "
-            "El sistema ejecutara un **debate focalizado** entre los 7 gestores sobre tus activos, "
-            "seguido de las **8 evaluaciones independientes** y el **veredicto final**."
-        )
-        portfolio_input = st.text_area(
-            "Tickers (separados por comas)",
-            placeholder="Ej: AAPL, MSFT, TSLA, NVDA, IBE.MC, ITX.MC",
-            height=80,
-            key="portfolio_tickers_input",
-        )
+        pf_tab1, pf_tab2, pf_tab3 = st.tabs(["Mis posiciones", "Analizar cartera", "Historial cerradas"])
 
-        portfolio_run = st.button("Analizar Mi Cartera", type="primary", use_container_width=True, key="btn_portfolio")
+        # --- Sub-tab 1: Gestor de posiciones ---
+        with pf_tab1:
+            st.subheader("Mis posiciones reales")
 
-        if portfolio_run:
-            raw_tickers = portfolio_input.strip()
-            if not raw_tickers:
-                st.warning("Introduce al menos un ticker para analizar.")
+            # Formulario para añadir posición
+            with st.expander("Añadir posición", expanded=False):
+                fc1, fc2, fc3, fc4 = st.columns(4)
+                new_ticker = fc1.text_input("Ticker", placeholder="AAPL", key="pf_new_ticker")
+                new_shares = fc2.number_input("Acciones", min_value=0.001, value=1.0, step=1.0, key="pf_new_shares")
+                new_price = fc3.number_input("Precio entrada", min_value=0.01, value=100.0, step=0.01, key="pf_new_price")
+                new_date = fc4.date_input("Fecha entrada", value=datetime.now(), key="pf_new_date")
+                new_notes = st.text_input("Notas (opcional)", placeholder="Compra por fundamentales sólidos", key="pf_new_notes")
+
+                if st.button("Añadir posición", key="btn_add_position"):
+                    if new_ticker.strip():
+                        add_position(
+                            new_ticker.strip(),
+                            new_shares,
+                            new_price,
+                            new_date.strftime("%Y-%m-%d"),
+                            new_notes,
+                        )
+                        st.success(f"Posición añadida: {new_ticker.strip().upper()}")
+                        st.rerun()
+                    else:
+                        st.warning("Introduce un ticker válido.")
+
+            # Snapshot actual
+            snapshot = portfolio_snapshot()
+            if snapshot.empty:
+                st.info("No tienes posiciones registradas. Usa el formulario de arriba para añadir tus posiciones reales.")
             else:
-                # Limpiar y validar
-                tickers_clean = ",".join(t.strip().upper() for t in raw_tickers.replace(";", ",").split(",") if t.strip())
-                ticker_list = [t for t in tickers_clean.split(",") if t]
-                st.info(f"Analizando **{len(ticker_list)}** activos: {', '.join(ticker_list)}")
+                # Resumen agregado
+                risk = portfolio_risk_summary(snapshot)
+                if risk:
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Valor total", f"${risk['total_value']:,.0f}")
+                    m2.metric("P&L total", f"${risk['total_pnl']:+,.0f}",
+                              delta=f"{risk['total_pnl_pct']:+.1f}%")
+                    m3.metric("Posiciones", risk["num_positions"])
+                    m4.metric("En ganancia", risk["num_winning"])
+                    m5.metric("En pérdida", risk["num_losing"])
 
-                cmd = build_command(
-                    model=model.strip(),
-                    host=host.strip(),
-                    seconds=int(seconds),
-                    max_turns=int(max_turns),
-                    context_lines=int(context_lines),
-                    portfolio=tickers_clean,
-                )
-                code, full_output = stream_process(cmd)
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric("Concentración Top 3", f"{risk['top3_concentration']:.0f}%")
+                    mc2.metric("Mayor ganancia", f"{risk['max_gain_ticker']} ({risk['max_gain_pct']:+.1f}%)")
+                    mc3.metric("Mayor pérdida", f"{risk['max_loss_ticker']} ({risk['max_loss_pct']:+.1f}%)")
+
+                    # Exposición por sector
+                    if risk.get("sector_exposure"):
+                        with st.expander("Exposición por sector"):
+                            sector_df = pd.DataFrame([
+                                {"Sector": k, "Peso %": v}
+                                for k, v in risk["sector_exposure"].items()
+                            ])
+                            st.dataframe(sector_df, use_container_width=True, hide_index=True)
+
+                # Tabla de posiciones con P&L
+                def _color_pnl(val):
+                    if isinstance(val, (int, float)):
+                        if val > 0:
+                            return "color: #22c55e; font-weight: 600"
+                        elif val < 0:
+                            return "color: #ef4444; font-weight: 600"
+                    return ""
+
+                display_cols = ["Ticker", "Acciones", "Precio entrada", "Precio actual",
+                                "P&L", "P&L %", "Peso %", "Fecha entrada", "Notas"]
+                display_df = snapshot[[c for c in display_cols if c in snapshot.columns]]
+                styled = display_df.style.applymap(_color_pnl, subset=["P&L", "P&L %"])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                # Cerrar / eliminar posiciones
+                with st.expander("Cerrar o eliminar posición"):
+                    pos_options = {
+                        f"{row['Ticker']} ({row['Acciones']} acc. @ ${row['Precio entrada']:.2f}) — id:{row['id']}": int(row["id"])
+                        for _, row in snapshot.iterrows()
+                    }
+                    selected_pos = st.selectbox("Seleccionar posición", list(pos_options.keys()), key="pf_close_select")
+                    pos_id = pos_options.get(selected_pos, 0)
+
+                    ac1, ac2 = st.columns(2)
+                    close_price_input = ac1.number_input("Precio de venta", min_value=0.01, value=100.0, key="pf_close_price")
+                    if ac1.button("Cerrar (vender)", key="btn_close_pos"):
+                        if pos_id:
+                            close_position(pos_id, close_price_input)
+                            st.success("Posición cerrada.")
+                            st.rerun()
+                    if ac2.button("Eliminar registro", key="btn_del_pos", type="secondary"):
+                        if pos_id:
+                            delete_position(pos_id)
+                            st.warning("Posición eliminada.")
+                            st.rerun()
+
+        # --- Sub-tab 2: Debate focalizado ---
+        with pf_tab2:
+            st.subheader("Analiza tu cartera con debate focalizado")
+            st.markdown(
+                "Introduce los tickers de los activos que tienes en cartera. "
+                "El sistema ejecutara un **debate focalizado** entre los 7 gestores sobre tus activos, "
+                "seguido de las **8 evaluaciones independientes** y el **veredicto final**."
+            )
+
+            # Pre-rellenar con posiciones abiertas si existen
+            open_pos = get_open_positions()
+            default_tickers = ", ".join(open_pos["ticker"].unique()) if not open_pos.empty else ""
+
+            portfolio_input = st.text_area(
+                "Tickers (separados por comas)",
+                value=default_tickers,
+                placeholder="Ej: AAPL, MSFT, TSLA, NVDA, IBE.MC, ITX.MC",
+                height=80,
+                key="portfolio_tickers_input",
+            )
+
+            portfolio_run = st.button("Analizar Mi Cartera", type="primary", use_container_width=True, key="btn_portfolio")
+
+            if portfolio_run:
+                raw_tickers = portfolio_input.strip()
+                if not raw_tickers:
+                    st.warning("Introduce al menos un ticker para analizar.")
+                else:
+                    # Limpiar y validar
+                    tickers_clean = ",".join(t.strip().upper() for t in raw_tickers.replace(";", ",").split(",") if t.strip())
+                    ticker_list = [t for t in tickers_clean.split(",") if t]
+                    st.info(f"Analizando **{len(ticker_list)}** activos: {', '.join(ticker_list)}")
+
+                    cmd = build_command(
+                        model=model.strip(),
+                        host=host.strip(),
+                        seconds=int(seconds),
+                        max_turns=int(max_turns),
+                        context_lines=int(context_lines),
+                        portfolio=tickers_clean,
+                    )
+                    code, full_output = stream_process(cmd)
+                    st.session_state["portfolio_code"] = code
+                    st.session_state["portfolio_output"] = full_output
+
+                    # Guardar en historico
+                    if code == 0:
+                        tables = extract_named_tables(full_output)
+                        top10_df = extract_top10_table(full_output)
+                        score_df = build_scoreboard(top10_df, tables)
+                        _save_run(f"{model.strip()} [Cartera]", score_df, full_output)
+
+            # Renderizar siempre que haya resultados guardados
+            if st.session_state["portfolio_output"] is not None:
+                full_output = st.session_state["portfolio_output"]
+                code = st.session_state["portfolio_code"]
 
                 st.divider()
                 st.subheader("Resultado - Mi Cartera")
@@ -2342,13 +2689,6 @@ def main() -> None:
 
                 render_timer(full_output)
 
-                # Guardar en historico
-                if code == 0:
-                    tables = extract_named_tables(full_output)
-                    top10_df = extract_top10_table(full_output)
-                    score_df = build_scoreboard(top10_df, tables)
-                    _save_run(f"{model.strip()} [Cartera]", score_df, full_output)
-
                 # Renderizar resultados (1 sola pasada, sin buscar P2/P3)
                 _render_portfolio_results(full_output)
 
@@ -2359,6 +2699,46 @@ def main() -> None:
                     mime="text/plain",
                     use_container_width=True,
                 )
+
+        # --- Sub-tab 3: Historial de posiciones cerradas ---
+        with pf_tab3:
+            st.subheader("Historial de posiciones cerradas")
+            closed = get_closed_positions()
+            if closed.empty:
+                st.info("No hay posiciones cerradas todavía.")
+            else:
+                closed["P&L"] = (closed["close_price"] - closed["entry_price"]) * closed["shares"]
+                closed["P&L %"] = ((closed["close_price"] - closed["entry_price"]) / closed["entry_price"] * 100).round(1)
+                closed = closed.rename(columns={
+                    "ticker": "Ticker", "shares": "Acciones",
+                    "entry_price": "Precio entrada", "entry_date": "Fecha entrada",
+                    "close_price": "Precio venta", "close_date": "Fecha venta",
+                    "notes": "Notas",
+                })
+
+                total_pnl = closed["P&L"].sum()
+                wins = (closed["P&L"] > 0).sum()
+                losses = (closed["P&L"] <= 0).sum()
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("P&L total cerradas", f"${total_pnl:+,.0f}")
+                c2.metric("Operaciones ganadoras", wins)
+                c3.metric("Operaciones perdedoras", losses)
+
+                display_cols = ["Ticker", "Acciones", "Precio entrada", "Fecha entrada",
+                                "Precio venta", "Fecha venta", "P&L", "P&L %", "Notas"]
+                display_df = closed[[c for c in display_cols if c in closed.columns]]
+
+                def _color_pnl_closed(val):
+                    if isinstance(val, (int, float)):
+                        if val > 0:
+                            return "color: #22c55e; font-weight: 600"
+                        elif val < 0:
+                            return "color: #ef4444; font-weight: 600"
+                    return ""
+
+                styled = display_df.style.applymap(_color_pnl_closed, subset=["P&L", "P&L %"])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 def _render_portfolio_results(full_output: str) -> None:

@@ -103,15 +103,15 @@ def technical_analysis_review(top10_assets: list[dict[str, Any]], prices: dict[s
         close_hist = data.get("close_hist", [])
         ew = classify_elliott_wave(close_hist)
         price = fmt_num(ew["precio_actual"], 2)
-        t1m = f"{fmt_num(ew['target_1m'], 2)} ({ew['rent_1m']:+.1f}%)"
-        t3m = f"{fmt_num(ew['target_3m'], 2)} ({ew['rent_3m']:+.1f}%)"
-        t6m = f"{fmt_num(ew['target_6m'], 2)} ({ew['rent_6m']:+.1f}%)"
-        ew_verdict = "OK" if (ew["onda"] in favorable_waves and ew["rent_6m"] > 0) else "NOK"
+        t1m = f"{fmt_num(ew['target_1y'], 2)} ({ew['rent_1y']:+.1f}%)"
+        t3m = f"{fmt_num(ew['target_3y'], 2)} ({ew['rent_3y']:+.1f}%)"
+        t6m = f"{fmt_num(ew['target_6y'], 2)} ({ew['rent_6y']:+.1f}%)"
+        ew_verdict = "OK" if (ew["onda"] in favorable_waves and ew["rent_6y"] > 0) else "NOK"
         if ew_verdict == "OK":
             ew_ok_count += 1
         ew_rows.append([str(idx), ticker, asset.get("nombre", ticker), ew["onda"], ew["fase"], price, t1m, t3m, t6m, ew_verdict, ew["prevision"]])
 
-    ew_table = render_md_table(["#", "Ticker", "Nombre", "Onda", "Fase", "Precio", "Target 1m", "Target 3m", "Target 6m", "Veredicto", "Prevision"], ew_rows)
+    ew_table = render_md_table(["#", "Ticker", "Nombre", "Onda", "Fase", "Precio", "Target 1y", "Target 3y", "Target 6y", "Veredicto", "Prevision"], ew_rows)
     print(ew_table, flush=True)
     print(f"\nResultado Elliott: {ew_ok_count} OK / {len(top10_assets) - ew_ok_count} NOK de {len(top10_assets)} activos.", flush=True)
 

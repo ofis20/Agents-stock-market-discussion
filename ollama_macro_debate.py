@@ -36,6 +36,7 @@ from guru_holdings import (
     compute_guru_conviction,
     guru_holdings_section,
 )
+from macro_context import load_macro_context
 from market_data import TICKERS, load_all_market_data
 from ollama_client import DEFAULT_HOST, OllamaClient, assign_models_to_agents
 
@@ -102,6 +103,45 @@ def _run_evaluators(
         "ta": ta, "fa": fa, "risk": risk, "sent": sent,
         "macd": macd, "inst": inst, "wyckoff": wyckoff, "relative": relative,
     }
+
+
+def elliott_llm_review(
+    client: OllamaClient,
+    model: str,
+    ew_table: str,
+    top20_assets: list[dict[str, Any]],
+) -> str:
+    """Usa el mejor modelo LLM para interpretar los datos de Elliott Wave a largo plazo."""
+    print("\n" + "=" * 60, flush=True)
+    print("INTERPRETACION ELLIOTT WAVE LARGO PLAZO (LLM)", flush=True)
+    print("=" * 60, flush=True)
+
+    tickers_str = ", ".join(a["ticker"] for a in top20_assets[:10])
+    system = (
+        "Eres un analista experto en Ondas de Elliott con enfoque exclusivo de MUY LARGO PLAZO (1-6 anos). "
+        "Se te proporcionan datos algoritmicos de Elliott Wave basados en 6 anos de historico, con targets a 1, 3 y 6 anos. "
+        "Tu trabajo es:\n"
+        "1. Interpretar en que fase del SUPERCICLO se encuentra cada activo (usando teoria de grados de onda de Elliott)\n"
+        "2. Identificar los 3-5 activos con mejor estructura de onda para acumulacion generacional\n"
+        "3. Senalar los activos en ondas peligrosas (5↑, A↓) donde NO se debe invertir\n"
+        "4. Dar una vision del SUPERCICLO completo: donde estamos en la gran estructura de mercado a 6 anos\n"
+        "Responde en espanol, maximo 15 lineas, sin saludos ni despedidas. Se conciso y directo."
+    )
+    user = (
+        f"Activos analizados: {tickers_str}\n\n"
+        f"Resultados algoritmicos de Elliott Wave (6 anos de historico, targets a 1y/3y/6y):\n{ew_table}\n\n"
+        "Interpreta estos datos con vision de SUPERCICLO (1-6 anos). "
+        "Identifica los mejores activos para acumulacion generacional y los que deben evitarse."
+    )
+
+    print(f"\n[Analista Elliott LLM — modelo: {model}]", flush=True)
+    text = client.stream_chat(
+        model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        num_predict=600,
+        temperature=0.3,
+    )
+    return text
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -223,7 +263,7 @@ def run_debate(args: argparse.Namespace) -> int:
     analyst_roles = [
         "Moderador Consenso", "Moderador Top 20",
         "Analista Tecnico", "Analista Fundamental",
-        "Gestor Riesgos", "Analista Sentimiento", "Veredicto Final",
+        "Gestor Riesgos", "Analista Sentimiento", "Analista Elliott", "Veredicto Final",
     ]
     model_map = assign_models_to_agents(available_models, AGENTS, analyst_roles)
 
@@ -238,24 +278,37 @@ def run_debate(args: argparse.Namespace) -> int:
     print("=" * 60)
     timer.stage("Inicializacion")
 
-    # Fase 0: Cargar datos reales de mercado y carteras de gurus en paralelo
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_market = pool.submit(load_all_market_data, 12, True)
+    # Fase 0: Cargar datos reales de mercado, carteras de gurus y contexto macro en paralelo
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fut_market = pool.submit(load_all_market_data, 72, True)
         fut_gurus = pool.submit(fetch_all_guru_holdings)
+        fut_macro = pool.submit(load_macro_context)
         briefings = fut_market.result()
         all_guru_holdings = fut_gurus.result()
+        macro_ctx = fut_macro.result()
 
     market_general = briefings.get("general", "")
     raw_prices: dict[str, dict[str, Any]] = briefings.get("raw_prices", {})
     raw_fundamentals: dict[str, dict[str, Any]] = briefings.get("raw_fundamentals", {})
 
+    # Enriquecer briefing con contexto macro adicional (economia, noticias, earnings)
+    extra_sections: list[str] = []
+    if macro_ctx.get("economic"):
+        extra_sections.append(macro_ctx["economic"])
+    if macro_ctx.get("earnings"):
+        extra_sections.append(macro_ctx["earnings"])
+    if macro_ctx.get("news"):
+        extra_sections.append(macro_ctx["news"])
+    if extra_sections:
+        market_general = market_general + "\n\n" + "\n\n".join(extra_sections)
+
     if market_general:
-        print("\n[Datos de mercado cargados correctamente]")
+        print("\n[Datos de mercado + contexto macro cargados correctamente]")
     else:
         print("\n[AVISO: Sin datos de mercado - el debate usara solo conocimiento del modelo]")
 
     guru_conv = compute_guru_conviction(all_guru_holdings, TICKERS)
-    timer.stage("Carga datos mercado + gurus")
+    timer.stage("Carga datos mercado + gurus + contexto macro")
 
     transcript: List[str] = []
     start = time.monotonic()
@@ -315,6 +368,15 @@ def run_debate(args: argparse.Namespace) -> int:
     wyckoff_table = ev["wyckoff"]
     relative_table = ev["relative"]
     timer.stage("Evaluadores (8 en paralelo)")
+
+    # Fase 4b: Interpretacion Elliott Wave largo plazo (LLM, mejor modelo)
+    elliott_llm_review(
+        client=client,
+        model=model_map["Analista Elliott"],
+        ew_table=ew_table,
+        top20_assets=top20_assets,
+    )
+    timer.stage("Elliott LLM largo plazo")
 
     # Fase 5: Veredicto final consolidado
     verdict_output = final_verdict(
@@ -455,7 +517,7 @@ def run_portfolio(args: argparse.Namespace) -> int:
     analyst_roles = [
         "Moderador Consenso", "Moderador Top 20",
         "Analista Tecnico", "Analista Fundamental",
-        "Gestor Riesgos", "Analista Sentimiento", "Veredicto Final",
+        "Gestor Riesgos", "Analista Sentimiento", "Analista Elliott", "Veredicto Final",
     ]
     model_map = assign_models_to_agents(available_models, AGENTS, analyst_roles)
 
@@ -468,7 +530,7 @@ def run_portfolio(args: argparse.Namespace) -> int:
 
     # Fase 0: Cargar datos de mercado y carteras de gurus en paralelo
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_market = pool.submit(load_all_market_data, 12, True)
+        fut_market = pool.submit(load_all_market_data, 72, True)
         fut_gurus = pool.submit(fetch_all_guru_holdings)
         briefings = fut_market.result()
         all_guru_holdings = fut_gurus.result()
@@ -572,6 +634,15 @@ def run_portfolio(args: argparse.Namespace) -> int:
     wyckoff_table = ev["wyckoff"]
     relative_table = ev["relative"]
     timer.stage("Evaluadores (8 en paralelo)")
+
+    # Fase 4b: Interpretacion Elliott Wave largo plazo (LLM, mejor modelo)
+    elliott_llm_review(
+        client=client,
+        model=model_map["Analista Elliott"],
+        ew_table=ew_table,
+        top20_assets=portfolio_assets,
+    )
+    timer.stage("Elliott LLM largo plazo")
 
     # Fase 5: Veredicto final consolidado
     verdict_output = final_verdict(
