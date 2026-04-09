@@ -63,7 +63,7 @@ def sort_models_by_preference(models: list[str]) -> list[str]:
     return sorted(models, key=_priority)
 
 
-MODERATOR_ROLES = {"Moderador Consenso", "Moderador Top 20", "Veredicto Final", "Analista Elliott"}
+MODERATOR_ROLES = {"Moderador Consenso", "Moderador Top 20", "Devils Advocate", "Veredicto Final", "Analista Elliott"}
 
 
 def assign_models_to_agents(available_models: list[str], agents: list["Agent"], analyst_roles: list[str]) -> dict[str, str]:

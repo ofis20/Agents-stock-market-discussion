@@ -11,6 +11,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import altair as alt
 import numpy as np
@@ -26,6 +27,11 @@ from portfolio_tracker import (
     get_open_positions, get_closed_positions,
     portfolio_snapshot, portfolio_risk_summary,
     compute_exit_signals, compute_performance_report, compute_entry_levels,
+)
+from professional_analytics import (
+    compute_professional_report,
+    ensure_runs_metadata_column,
+    extract_run_metadata_json,
 )
 
 
@@ -193,6 +199,8 @@ def _detect_phase(line: str) -> str | None:
         return "Tercera pasada (filtrado final)..."
     if "TOP 20 INVERSIONES" in upper:
         return "Generando Top 20..."
+    if "VALIDACION ADVERSARIAL DEL TOP 20" in upper:
+        return "Validacion adversarial..."
     m = re.match(r"\[Evaluando (\d+)/(\d+): (\S+)\]", line)
     if m:
         return f"Evaluando activo {m.group(1)}/{m.group(2)}: {m.group(3)}"
@@ -273,6 +281,7 @@ def stream_process(cmd: list[str]) -> tuple[int, str]:
                             "Segunda pasada (sin EVITAR)...": "Moderador Consenso",
                             "Tercera pasada (filtrado final)...": "Moderador Consenso",
                             "Generando Top 20...": "Moderador Top 20",
+                            "Validacion adversarial...": "Devils Advocate",
                             "Veredicto final...": "Veredicto Final",
                         }
                         role = _phase_role_map.get(current_phase, "")
@@ -390,7 +399,7 @@ def extract_top10_table(text: str) -> pd.DataFrame:
 
     # Solo parsear lineas DESPUES del marker de validacion
     marker = "[Top 20 validado]"
-    marker_pos = text.find(marker)
+    marker_pos = text.rfind(marker)
     search_text = text[marker_pos:] if marker_pos != -1 else text
 
     for raw_line in search_text.splitlines():
@@ -772,6 +781,14 @@ _PASS2_MARKER = "[=== SEGUNDA PASADA (sin EVITAR) ===]"
 _PASS3_MARKER = "[=== TERCERA PASADA (sin EVITAR P1+P2) ===]"
 
 
+def _extract_latest_pass_output(full_output: str) -> str:
+    if _PASS3_MARKER in full_output:
+        return full_output[full_output.index(_PASS3_MARKER):]
+    if _PASS2_MARKER in full_output:
+        return full_output[full_output.index(_PASS2_MARKER):]
+    return full_output
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. HISTORICO SQLite
 # ═══════════════════════════════════════════════════════════════════════════
@@ -795,6 +812,7 @@ def _init_db() -> None:
         conn.execute("ALTER TABLE runs ADD COLUMN prices_json TEXT")
     conn.commit()
     conn.close()
+    ensure_runs_metadata_column(HISTORY_DB)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -829,10 +847,11 @@ def _save_run(model: str, score_df: pd.DataFrame, full_output: str) -> None:
     sb_json = score_df.to_json(orient="records") if not score_df.empty else "[]"
     # Capturar precios al momento de la recomendacion
     prices_at_rec = _fetch_current_prices(tuple(tickers)) if tickers else {}
+    metadata_json = json.dumps(extract_run_metadata_json(full_output)) if full_output else "{}"
     conn = sqlite3.connect(str(HISTORY_DB))
     conn.execute(
-        "INSERT INTO runs (timestamp, model, tickers_json, scoreboard_json, full_output, prices_json) VALUES (?, ?, ?, ?, ?, ?)",
-        (datetime.now().isoformat(), model, json.dumps(tickers), sb_json, full_output, json.dumps(prices_at_rec)),
+        "INSERT INTO runs (timestamp, model, tickers_json, scoreboard_json, full_output, prices_json, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(), model, json.dumps(tickers), sb_json, full_output, json.dumps(prices_at_rec), metadata_json),
     )
     conn.commit()
     conn.close()
@@ -841,9 +860,24 @@ def _save_run(model: str, score_df: pd.DataFrame, full_output: str) -> None:
 def _load_history() -> pd.DataFrame:
     _init_db()
     conn = sqlite3.connect(str(HISTORY_DB))
-    df = pd.read_sql_query("SELECT id, timestamp, model, tickers_json, scoreboard_json FROM runs ORDER BY id DESC LIMIT 20", conn)
+    df = pd.read_sql_query("SELECT id, timestamp, model, tickers_json, scoreboard_json, metadata_json FROM runs ORDER BY id DESC LIMIT 20", conn)
     conn.close()
     return df
+
+
+def _load_latest_metadata() -> dict[str, Any]:
+    _init_db()
+    conn = sqlite3.connect(str(HISTORY_DB))
+    row = conn.execute(
+        "SELECT metadata_json FROM runs WHERE metadata_json IS NOT NULL AND metadata_json != '{}' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        return {}
 
 
 def _load_previous_scoreboard() -> pd.DataFrame:
@@ -1095,6 +1129,17 @@ def render_history_tab() -> None:
         ts = row["timestamp"][:19].replace("T", " ")
         tickers = json.loads(row["tickers_json"]) if row["tickers_json"] else []
         with st.expander(f"{ts} — {row['model']} ({len(tickers)} activos)"):
+            metadata = {}
+            if "metadata_json" in row.index and isinstance(row["metadata_json"], str) and row["metadata_json"]:
+                try:
+                    metadata = json.loads(row["metadata_json"])
+                except json.JSONDecodeError:
+                    metadata = {}
+            if metadata:
+                regime = metadata.get("market_regime", {}).get("name")
+                deploy = metadata.get("confidence_model", {}).get("deploy_pct")
+                if regime or deploy is not None:
+                    st.caption(f"Regimen: {regime or 'N/D'} | Capital sugerido: {deploy if deploy is not None else 'N/D'}%")
             if row["scoreboard_json"] and row["scoreboard_json"] != "[]":
                 sb = pd.read_json(row["scoreboard_json"], orient="records")
                 if not sb.empty:
@@ -1419,6 +1464,119 @@ def render_entry_levels() -> None:
         st.warning(f"**Cerca de zona de entrada:** {', '.join(l['Ticker'] for l in cercano)}")
     if esperar:
         st.info(f"**Esperar pullback:** {', '.join(l['Ticker'] for l in esperar)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b-5. ANALITICA PROFESIONAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def render_professional_analytics() -> None:
+    """Muestra métricas profesionales: alpha, drawdown, régimen y precisión por factor."""
+    st.subheader("Analítica profesional")
+    st.caption("Convierte el histórico en métricas de calidad de señal, alpha y control de riesgo.")
+
+    latest = _load_latest_metadata()
+    report = compute_professional_report(HISTORY_DB)
+
+    if not latest and not report:
+        st.info("Necesitas al menos una ejecución guardada con metadatos para ver esta analítica.")
+        return
+
+    if latest:
+        confidence = latest.get("confidence_model", {})
+        regime = latest.get("market_regime", {})
+        risk = latest.get("risk_summary", {})
+        devil = latest.get("devil_advocate", {})
+
+        st.markdown("#### Última ejecución")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Score confianza", f"{confidence.get('score', 0)}/100")
+        c2.metric("Capital sugerido", f"{confidence.get('deploy_pct', 0)}%")
+        c3.metric("Régimen", str(regime.get("name", "N/D")))
+        c4.metric("Sesgo", str(regime.get("stance", "N/D")))
+
+        if regime:
+            st.caption(
+                f"VIX {regime.get('signals', {}).get('vix', 'N/D')} | "
+                f"SPY 3m {regime.get('signals', {}).get('spy_3m', 'N/D')}% | "
+                f"QQQ vs SPY {regime.get('signals', {}).get('qqq_vs_spy', 'N/D')}%"
+            )
+            st.info(regime.get("summary", ""))
+
+        if confidence.get("rationale"):
+            st.markdown("#### Meta-modelo de confianza")
+            for line in confidence["rationale"]:
+                st.markdown(f"- {line}")
+
+        if risk:
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("Top 3 concentración", f"{risk.get('top3_concentration', 0):.1f}%")
+            rc2.metric("Posición máxima", f"{risk.get('max_position', 0):.1f}%")
+            rc3.metric("Volatilidad ponderada", f"{risk.get('weighted_volatility', 0):.1f}%")
+
+            risk_warnings = risk.get("warnings", [])
+            if risk_warnings:
+                st.markdown("#### Riesgos estructurales")
+                for warning in risk_warnings:
+                    st.markdown(f"- {warning}")
+
+            adjusted = risk.get("adjusted_weights", {})
+            top20 = latest.get("top20", [])
+            if adjusted and top20:
+                original = {asset.get("ticker"): asset.get("peso") for asset in top20}
+                rebalance_df = pd.DataFrame(
+                    [
+                        {
+                            "Ticker": ticker,
+                            "Peso actual": original.get(ticker, 0),
+                            "Peso ajustado": adjusted.get(ticker, 0),
+                        }
+                        for ticker in adjusted
+                    ]
+                ).sort_values("Peso ajustado", ascending=False)
+                st.markdown("#### Pesos ajustados por riesgo")
+                st.dataframe(rebalance_df, use_container_width=True, hide_index=True)
+
+        if devil:
+            st.markdown("#### Validación adversarial")
+            if devil.get("llm_verdict"):
+                st.warning(devil["llm_verdict"])
+            issues = devil.get("issues", [])
+            if issues:
+                for issue in issues:
+                    st.markdown(f"- {issue}")
+
+    if report:
+        summary = report.get("summary", {})
+        st.markdown("#### Histórico agregado")
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Runs", summary.get("runs", 0))
+        s2.metric("Rent. media", f"{summary.get('avg_return', 0):+.1f}%")
+        s3.metric("Rent. anualizada", f"{summary.get('annualized_return', 0):+.1f}%")
+        s4.metric("Alpha medio", f"{summary.get('avg_alpha', 0):+.1f}%")
+        s5.metric("Beat rate", f"{summary.get('beat_rate', 0):.0f}%")
+        s6.metric("Sharpe medio", f"{summary.get('avg_sharpe', 0):.2f}")
+
+        runs = report.get("portfolio_runs", [])
+        if runs:
+            st.markdown("#### Evolución por ejecución")
+            runs_df = pd.DataFrame(runs)
+            st.dataframe(runs_df, use_container_width=True, hide_index=True)
+
+        evaluators = report.get("evaluators", [])
+        if evaluators:
+            st.markdown("#### Precisión por evaluador")
+            st.dataframe(pd.DataFrame(evaluators), use_container_width=True, hide_index=True)
+
+        agents = report.get("agents", [])
+        if agents:
+            st.markdown("#### Precisión por agente")
+            st.dataframe(pd.DataFrame(agents), use_container_width=True, hide_index=True)
+
+        regimes = report.get("regimes", [])
+        if regimes:
+            st.markdown("#### Alpha por régimen")
+            st.dataframe(pd.DataFrame(regimes), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2334,7 +2492,7 @@ def render_results(full_output: str) -> None:
             pass2_output = full_output[idx2:idx3]
             pass3_output = full_output[idx3:]
 
-            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13 = st.tabs([
+            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14 = st.tabs([
                 "Resumen Pasada 1",
                 "Tablas Pasada 1",
                 "Resumen Pasada 2 (sin EVITAR)",
@@ -2346,6 +2504,7 @@ def render_results(full_output: str) -> None:
                 "Señales de salida",
                 "Niveles de entrada",
                 "Performance",
+                "Analítica Pro",
                 "Dashboard",
                 "Historico",
             ])
@@ -2373,13 +2532,15 @@ def render_results(full_output: str) -> None:
             with t11:
                 render_performance()
             with t12:
-                render_dashboard()
+                render_professional_analytics()
             with t13:
+                render_dashboard()
+            with t14:
                 render_history_tab()
         else:
             pass2_output = full_output[idx2:]
 
-            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11 = st.tabs([
+            t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12 = st.tabs([
                 "Resumen Pasada 1",
                 "Tablas Pasada 1",
                 "Resumen Pasada 2 (sin EVITAR)",
@@ -2389,6 +2550,7 @@ def render_results(full_output: str) -> None:
                 "Señales de salida",
                 "Niveles de entrada",
                 "Performance",
+                "Analítica Pro",
                 "Dashboard",
                 "Historico",
             ])
@@ -2412,13 +2574,15 @@ def render_results(full_output: str) -> None:
             with t9:
                 render_performance()
             with t10:
-                render_dashboard()
+                render_professional_analytics()
             with t11:
+                render_dashboard()
+            with t12:
                 render_history_tab()
     else:
-        t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+        t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs([
             "Resumen", "Tablas de evaluacion", "Alertas de precio",
-            "Señales de salida", "Niveles de entrada", "Performance",
+            "Señales de salida", "Niveles de entrada", "Performance", "Analítica Pro",
             "Dashboard", "Historico",
         ])
         with t1:
@@ -2434,8 +2598,10 @@ def render_results(full_output: str) -> None:
         with t6:
             render_performance()
         with t7:
-            render_dashboard()
+            render_professional_analytics()
         with t8:
+            render_dashboard()
+        with t9:
             render_history_tab()
 
 
@@ -2483,12 +2649,7 @@ def main() -> None:
 
             # Guardar en historico (siempre la ultima pasada disponible)
             if code == 0:
-                if _PASS3_MARKER in full_output:
-                    last_pass = full_output[full_output.index(_PASS3_MARKER):]
-                elif _PASS2_MARKER in full_output:
-                    last_pass = full_output[full_output.index(_PASS2_MARKER):]
-                else:
-                    last_pass = full_output
+                last_pass = _extract_latest_pass_output(full_output)
                 tables = extract_named_tables(last_pass)
                 top10_df = extract_top10_table(last_pass)
                 score_df = build_scoreboard(top10_df, tables)
@@ -2666,8 +2827,9 @@ def main() -> None:
 
                     # Guardar en historico
                     if code == 0:
-                        tables = extract_named_tables(full_output)
-                        top10_df = extract_top10_table(full_output)
+                        last_pass = _extract_latest_pass_output(full_output)
+                        tables = extract_named_tables(last_pass)
+                        top10_df = extract_top10_table(last_pass)
                         score_df = build_scoreboard(top10_df, tables)
                         _save_run(f"{model.strip()} [Cartera]", score_df, full_output)
 

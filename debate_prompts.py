@@ -155,3 +155,55 @@ def build_top20_messages(context: str, candidates_str: str) -> tuple[str, str]:
         """
     ).strip()
     return system, user
+
+
+def build_devils_advocate_messages(
+    consensus: str,
+    top20_text: str,
+    market_briefing: str,
+    regime_summary: str,
+    risk_summary: str,
+) -> tuple[str, str]:
+    system = (
+        "Eres un comite de control de riesgos y validacion institucional. "
+        "Tu trabajo es actuar como abogado del diablo del Top 20 generado por el sistema. "
+        "Debes detectar incoherencias, groupthink, activos demasiado correlacionados, conflictos con el contexto macro, "
+        "y cualquier catalizador dudoso o debil. No reescribas la cartera, auditala."
+    )
+    user = textwrap.dedent(
+        f"""
+        CONTEXTO MACRO Y DATOS REALES:
+        {market_briefing}
+
+        CONSENSO FINAL:
+        {consensus}
+
+        REGIMEN DETECTADO:
+        {regime_summary}
+
+        RIESGO DE CARTERA DETECTADO:
+        {risk_summary}
+
+        TOP 20 PROPUESTO:
+        {top20_text}
+
+        Responde en espanol y con este formato exacto:
+        Score de confianza: NN/100
+        Capital a desplegar: NN%
+        Dictamen final: una frase breve
+        Riesgos clave:
+        - riesgo 1
+        - riesgo 2
+        - riesgo 3
+        Observaciones:
+        - observacion 1
+        - observacion 2
+
+        Reglas:
+        - Si detectas concentracion o contradiccion macro, penaliza fuerte el score.
+        - Si detectas cartera coherente, diversificada y alineada con el contexto, sube el score.
+        - No inventes datos fuera del briefing.
+        - Se concreto y directo.
+        """
+    ).strip()
+    return system, user

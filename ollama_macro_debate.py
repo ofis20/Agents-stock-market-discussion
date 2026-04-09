@@ -30,6 +30,7 @@ from debate_prompts import (
     CONSENSUS_FILLERS,
     build_agent_turn_prompt,
     build_consensus_messages,
+    build_devils_advocate_messages,
 )
 from guru_holdings import (
     fetch_all_guru_holdings,
@@ -39,6 +40,14 @@ from guru_holdings import (
 from macro_context import load_macro_context
 from market_data import TICKERS, load_all_market_data
 from ollama_client import DEFAULT_HOST, OllamaClient, assign_models_to_agents
+from professional_analytics import (
+    build_confidence_model,
+    detect_market_regime,
+    emit_run_metadata,
+    extract_agent_signals,
+    parse_confidence_from_text,
+    summarize_portfolio_risk,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -142,6 +151,37 @@ def elliott_llm_review(
         temperature=0.3,
     )
     return text
+
+
+def devils_advocate_review(
+    client: OllamaClient,
+    model: str,
+    consensus_text: str,
+    top20_text: str,
+    market_briefing: str,
+    regime_summary: str,
+    risk_summary: str,
+) -> str:
+    """Auditoria LLM adversarial del Top 20 antes del veredicto final."""
+    print("\n" + "=" * 60, flush=True)
+    print("VALIDACION ADVERSARIAL DEL TOP 20", flush=True)
+    print("=" * 60, flush=True)
+
+    system, user = build_devils_advocate_messages(
+        consensus=consensus_text,
+        top20_text=top20_text,
+        market_briefing=market_briefing,
+        regime_summary=regime_summary,
+        risk_summary=risk_summary,
+    )
+
+    print(f"\n[Devil's Advocate — modelo: {model}]", flush=True)
+    return client.stream_chat(
+        model,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        num_predict=500,
+        temperature=0.2,
+    )
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -261,7 +301,7 @@ def run_debate(args: argparse.Namespace) -> int:
 
     # Asignar modelos diversos a cada agente y analista
     analyst_roles = [
-        "Moderador Consenso", "Moderador Top 20",
+        "Moderador Consenso", "Moderador Top 20", "Devils Advocate",
         "Analista Tecnico", "Analista Fundamental",
         "Gestor Riesgos", "Analista Sentimiento", "Analista Elliott", "Veredicto Final",
     ]
@@ -334,7 +374,7 @@ def run_debate(args: argparse.Namespace) -> int:
     timer.stage(f"Debate ({turn_count} turnos)")
 
     # Fase 2: Consenso
-    consensus_and_summary(
+    consensus_text = consensus_and_summary(
         client=client,
         model=model_map["Moderador Consenso"],
         transcript=transcript,
@@ -355,6 +395,29 @@ def run_debate(args: argparse.Namespace) -> int:
         guru_conviction=guru_conv,
     )
     timer.stage("Top 20 inversiones")
+
+    market_regime = detect_market_regime(raw_prices)
+    risk_summary = summarize_portfolio_risk(top20_assets, raw_prices, raw_fundamentals)
+    regime_summary = (
+        f"Regimen={market_regime['name']}, stance={market_regime['stance']}, "
+        f"riesgo={market_regime['risk_level']}, VIX={market_regime['signals']['vix']}, "
+        f"SPY3m={market_regime['signals']['spy_3m']}%. {market_regime['summary']}"
+    )
+    risk_text = (
+        f"Top3={risk_summary.get('top3_concentration', 0)}%, max={risk_summary.get('max_position', 0)}%, "
+        f"vol={risk_summary.get('weighted_volatility', 0)}%, warnings={'; '.join(risk_summary.get('warnings', []))}"
+    )
+    devil_advocate_text = devils_advocate_review(
+        client=client,
+        model=model_map["Devils Advocate"],
+        consensus_text=consensus_text,
+        top20_text=_top20_text,
+        market_briefing=market_general,
+        regime_summary=regime_summary,
+        risk_summary=risk_text,
+    )
+    devil_advocate = parse_confidence_from_text(devil_advocate_text)
+    timer.stage("Validacion adversarial")
 
     # Fase 4: Evaluaciones independientes EN PARALELO (con datos reales)
     print("\n[Ejecutando 8 evaluadores...]", flush=True)
@@ -403,6 +466,9 @@ def run_debate(args: argparse.Namespace) -> int:
 
     # === SEGUNDA PASADA: excluir activos EVITAR ===
     evitar_tickers = extract_evitar_tickers(verdict_output)
+    final_assets = top20_assets
+    final_verdict_output = verdict_output
+
     if evitar_tickers:
         print("\n" + "=" * 60, flush=True)
         print("[=== SEGUNDA PASADA (sin EVITAR) ===]", flush=True)
@@ -443,6 +509,8 @@ def run_debate(args: argparse.Namespace) -> int:
             wyckoff_table=wyckoff_table2,
             relative_table=relative_table2,
         )
+        final_assets = top20_assets2
+        final_verdict_output = verdict_output2
 
         # === TERCERA PASADA: excluir tambien los EVITAR de la pasada 2 ===
         evitar_tickers2 = extract_evitar_tickers(verdict_output2)
@@ -488,8 +556,29 @@ def run_debate(args: argparse.Namespace) -> int:
                 wyckoff_table=wyckoff_table3,
                 relative_table=relative_table3,
             )
+            final_assets = top20_assets3
+            final_verdict_output = verdict_output3
 
     timer.stage("Pasadas adicionales")
+
+    final_risk_summary = summarize_portfolio_risk(final_assets, raw_prices, raw_fundamentals)
+    final_confidence_model = build_confidence_model(
+        verdict_output=final_verdict_output,
+        devil_advocate=devil_advocate,
+        regime=market_regime,
+        risk_summary=final_risk_summary,
+    )
+    emit_run_metadata(
+        {
+            "run_type": "debate",
+            "market_regime": market_regime,
+            "risk_summary": final_risk_summary,
+            "devil_advocate": devil_advocate,
+            "confidence_model": final_confidence_model,
+            "agent_signals": extract_agent_signals(transcript, set(raw_prices.keys())),
+            "top20": final_assets,
+        }
+    )
 
     # Fase 6: Diagrama de arquitectura
     print_architecture_diagram()
@@ -515,7 +604,7 @@ def run_portfolio(args: argparse.Namespace) -> int:
     model = client.resolve_model(args.model)
 
     analyst_roles = [
-        "Moderador Consenso", "Moderador Top 20",
+        "Moderador Consenso", "Moderador Top 20", "Devils Advocate",
         "Analista Tecnico", "Analista Fundamental",
         "Gestor Riesgos", "Analista Sentimiento", "Analista Elliott", "Veredicto Final",
     ]
@@ -528,16 +617,28 @@ def run_portfolio(args: argparse.Namespace) -> int:
     print(f"Duracion debate: {args.seconds} segundos")
     print("=" * 60)
 
-    # Fase 0: Cargar datos de mercado y carteras de gurus en paralelo
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Fase 0: Cargar datos de mercado, contexto macro y carteras de gurus en paralelo
+    with ThreadPoolExecutor(max_workers=3) as pool:
         fut_market = pool.submit(load_all_market_data, 72, True)
         fut_gurus = pool.submit(fetch_all_guru_holdings)
+        fut_macro = pool.submit(load_macro_context)
         briefings = fut_market.result()
         all_guru_holdings = fut_gurus.result()
+        macro_ctx = fut_macro.result()
 
     market_general = briefings.get("general", "")
     raw_prices: dict[str, dict[str, Any]] = briefings.get("raw_prices", {})
     raw_fundamentals: dict[str, dict[str, Any]] = briefings.get("raw_fundamentals", {})
+
+    extra_sections: list[str] = []
+    if macro_ctx.get("economic"):
+        extra_sections.append(macro_ctx["economic"])
+    if macro_ctx.get("earnings"):
+        extra_sections.append(macro_ctx["earnings"])
+    if macro_ctx.get("news"):
+        extra_sections.append(macro_ctx["news"])
+    if extra_sections:
+        market_general = market_general + "\n\n" + "\n\n".join(extra_sections)
 
     if market_general:
         print("\n[Datos de mercado cargados correctamente]")
@@ -589,7 +690,7 @@ def run_portfolio(args: argparse.Namespace) -> int:
     timer.stage(f"Debate ({turn_count} turnos)")
 
     # Fase 2: Consenso focalizado
-    consensus_and_summary(
+    consensus_text = consensus_and_summary(
         client=client,
         model=model_map["Moderador Consenso"],
         transcript=transcript,
@@ -621,6 +722,34 @@ def run_portfolio(args: argparse.Namespace) -> int:
     for asset in portfolio_assets:
         print(f"{asset['rank']}. {asset['ticker']} - {asset['nombre']} - {asset['tipo']} - {asset['peso']}% - {asset['tesis']}", flush=True)
     print("\n[Top 20 validado]", flush=True)
+    top20_text = "\n".join(
+        f"{asset['rank']}. {asset['ticker']} - {asset['nombre']} - {asset['tipo']} - {asset['peso']}% - {asset['tesis']}"
+        for asset in portfolio_assets
+    )
+    print(top20_text, flush=True)
+
+    market_regime = detect_market_regime(raw_prices)
+    risk_summary = summarize_portfolio_risk(portfolio_assets, raw_prices, raw_fundamentals)
+    regime_summary = (
+        f"Regimen={market_regime['name']}, stance={market_regime['stance']}, "
+        f"riesgo={market_regime['risk_level']}, VIX={market_regime['signals']['vix']}, "
+        f"SPY3m={market_regime['signals']['spy_3m']}%. {market_regime['summary']}"
+    )
+    risk_text = (
+        f"Top3={risk_summary.get('top3_concentration', 0)}%, max={risk_summary.get('max_position', 0)}%, "
+        f"vol={risk_summary.get('weighted_volatility', 0)}%, warnings={'; '.join(risk_summary.get('warnings', []))}"
+    )
+    devil_advocate_text = devils_advocate_review(
+        client=client,
+        model=model_map["Devils Advocate"],
+        consensus_text=consensus_text,
+        top20_text=top20_text,
+        market_briefing=portfolio_briefing,
+        regime_summary=regime_summary,
+        risk_summary=risk_text,
+    )
+    devil_advocate = parse_confidence_from_text(devil_advocate_text)
+    timer.stage("Validacion adversarial")
 
     # Fase 4: Evaluaciones independientes EN PARALELO (datos reales)
     print("\n[Ejecutando 8 evaluadores en paralelo...]", flush=True)
@@ -656,6 +785,25 @@ def run_portfolio(args: argparse.Namespace) -> int:
         inst_table=inst_table,
         wyckoff_table=wyckoff_table,
         relative_table=relative_table,
+    )
+
+    confidence_model = build_confidence_model(
+        verdict_output=verdict_output,
+        devil_advocate=devil_advocate,
+        regime=market_regime,
+        risk_summary=risk_summary,
+    )
+
+    emit_run_metadata(
+        {
+            "run_type": "portfolio",
+            "market_regime": market_regime,
+            "risk_summary": risk_summary,
+            "devil_advocate": devil_advocate,
+            "confidence_model": confidence_model,
+            "agent_signals": extract_agent_signals(transcript, set(raw_prices.keys())),
+            "top20": portfolio_assets,
+        }
     )
 
     # Fase 5b: Comparativa con carteras de gurus
