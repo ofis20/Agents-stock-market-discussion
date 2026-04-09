@@ -353,11 +353,14 @@ def run_debate(args: argparse.Namespace) -> int:
     transcript: List[str] = []
     start = time.monotonic()
     deadline = start + max(5, args.seconds)
+    min_turns = min(len(AGENTS), args.max_turns)
 
     turn_count = 0
-    while time.monotonic() < deadline and turn_count < args.max_turns:
+    while (turn_count < min_turns) or (time.monotonic() < deadline and turn_count < args.max_turns):
         for agent in AGENTS:
-            if time.monotonic() >= deadline or turn_count >= args.max_turns:
+            if turn_count >= args.max_turns:
+                break
+            if turn_count >= min_turns and time.monotonic() >= deadline:
                 break
             agent_turn(
                 client=client,
@@ -669,11 +672,14 @@ def run_portfolio(args: argparse.Namespace) -> int:
     transcript: list[str] = []
     start = time.monotonic()
     deadline = start + max(5, args.seconds)
+    min_turns = min(len(AGENTS), args.max_turns)
 
     turn_count = 0
-    while time.monotonic() < deadline and turn_count < args.max_turns:
+    while (turn_count < min_turns) or (time.monotonic() < deadline and turn_count < args.max_turns):
         for agent in AGENTS:
-            if time.monotonic() >= deadline or turn_count >= args.max_turns:
+            if turn_count >= args.max_turns:
+                break
+            if turn_count >= min_turns and time.monotonic() >= deadline:
                 break
             agent_turn(
                 client=client,

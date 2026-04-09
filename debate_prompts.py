@@ -204,6 +204,8 @@ def build_devils_advocate_messages(
         - Si detectas cartera coherente, diversificada y alineada con el contexto, sube el score.
         - No inventes datos fuera del briefing.
         - Se concreto y directo.
+        - NO uses markdown, negritas, cursivas, bullets con asterisco ni comillas decorativas.
+        - Usa solo texto plano y conserva exactamente los encabezados pedidos.
         """
     ).strip()
     return system, user

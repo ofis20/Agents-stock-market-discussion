@@ -251,18 +251,30 @@ def extract_agent_signals(transcript: list[str], valid_tickers: set[str] | None 
 
 
 def parse_confidence_from_text(text: str) -> dict[str, Any]:
-    score_match = re.search(r"score de confianza\s*[:\-]\s*(\d{1,3})/100", text, flags=re.IGNORECASE)
-    deploy_match = re.search(r"capital a desplegar\s*[:\-]\s*(\d{1,3})%", text, flags=re.IGNORECASE)
-    verdict_match = re.search(r"dictamen final\s*[:\-]\s*(.+)", text, flags=re.IGNORECASE)
-    issues = [
-        line.strip("-• ")
-        for line in text.splitlines()
-        if line.strip().startswith(("-", "•"))
-    ]
+    clean = re.sub(r'[*_`#>"]', "", text)
+    clean = re.sub(r"\s+", " ", clean.replace("\r", " ")).strip()
+    score_match = re.search(r"score de confianza\s*[:\-]\s*(\d{1,3})\s*/\s*100", clean, flags=re.IGNORECASE)
+    deploy_match = re.search(r"capital a desplegar\s*[:\-]\s*(\d{1,3})\s*%", clean, flags=re.IGNORECASE)
+    verdict_match = re.search(r"dictamen final\s*[:\-]\s*(.+?)(?:riesgos clave\s*[:\-]|observaciones\s*[:\-]|$)", clean, flags=re.IGNORECASE)
+    issues: list[str] = []
+    active_section = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        normalized = re.sub(r'[*_`#>"]', "", line).strip().lower()
+        if not normalized:
+            continue
+        if normalized.startswith("riesgos clave"):
+            active_section = "riesgos"
+            continue
+        if normalized.startswith("observaciones"):
+            active_section = "observaciones"
+            continue
+        if active_section and line.startswith(("-", "*", "•")):
+            issues.append(line.strip("-*• "))
     return {
         "llm_score": int(score_match.group(1)) if score_match else None,
         "llm_deploy": int(deploy_match.group(1)) if deploy_match else None,
-        "llm_verdict": verdict_match.group(1).strip() if verdict_match else "",
+        "llm_verdict": verdict_match.group(1).strip(" .") if verdict_match else "",
         "issues": issues[:8],
         "raw_text": text.strip(),
     }
